@@ -27,6 +27,16 @@ class SidebarOutlineView: NSOutlineView,
 
     private var cellView: SidebarCellView?
 
+    // MARK: Tree explorer state
+    public var isTreeMode: Bool { UserDefaultsManagement.treeExplorer }
+    private var treeRoot = [Any]()
+    private var treeChildren = [ObjectIdentifier: [Any]]()
+    private var treeSignature = [ObjectIdentifier]()
+    private var isTreeSyncing = false
+    private var treeReloadWork: DispatchWorkItem?
+    private var pendingRootRebuild = false
+    public var pendingRestoreURL: URL?
+
     // MARK: Override
     override func rightMouseDown(with event: NSEvent) {
         guard let vc = ViewController.shared() else { return }
@@ -41,6 +51,27 @@ class SidebarOutlineView: NSOutlineView,
             if item.type == .Separator {
                 return
             }
+        }
+
+        if isTreeMode, item(atRow: rowIndex) is Note {
+            if !selectedRowIndexes.contains(rowIndex) {
+                selectRowIndexes(IndexSet(integer: rowIndex), byExtendingSelection: false)
+            }
+            window?.makeFirstResponder(self)
+
+            if let menu = vc.notesTableView.menu {
+                menu.autoenablesItems = false
+                for menuItem in menu.items {
+                    if vc.processFileMenuItems(menuItem, menuId: "popup") {
+                        menuItem.isEnabled = true
+                    } else {
+                        menuItem.isEnabled = vc.processShareMenuItems(menuItem, menuId: "popup")
+                    }
+                }
+                vc.loadMoveMenu()
+                NSMenu.popUpContextMenu(menu, with: event, for: vc.notesTableView)
+            }
+            return
         }
 
         if !selectedRowIndexes.contains(rowIndex) {
@@ -76,7 +107,23 @@ class SidebarOutlineView: NSOutlineView,
         wantsLayer = true
     }
     
+    override func mouseDown(with event: NSEvent) {
+        if isTreeMode {
+            treeMouseDown(with: event)
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+
+    fileprivate func superMouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
+        if isTreeMode, treeKeyDown(with: event) {
+            return
+        }
+
         // Tab to search
         if event.keyCode == kVK_Tab {
             self.viewDelegate?.search.becomeFirstResponder()
@@ -157,6 +204,11 @@ class SidebarOutlineView: NSOutlineView,
         guard let sidebarItems = self.sidebarItems else { return false }
         
         // Drag and drop project (reorder)
+        if isTreeMode, let data = info.draggingPasteboard.string(forType: NSPasteboard.project) {
+            guard let project = Storage.shared().getProjectBy(url: URL(fileURLWithPath: data)) else { return false }
+            return treeReorder(project: project, parent: item, childIndex: index)
+        }
+
         if let data = info.draggingPasteboard.string(forType: NSPasteboard.project) {
             let url = URL(fileURLWithPath: data)
             
@@ -218,11 +270,7 @@ class SidebarOutlineView: NSOutlineView,
         // Drag and drop Note
         let board = info.draggingPasteboard
 
-        var urls = [URL]()
-        if let data = info.draggingPasteboard.data(forType: NSPasteboard.note),
-           let unarchivedData = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, NSURL.self], from: data) as? [URL] {
-            urls = unarchivedData
-        }
+        let urls = SidebarOutlineView.draggedNoteURLs(board)
 
         // tags
         if let tag = item as? FSTag {
@@ -255,6 +303,10 @@ class SidebarOutlineView: NSOutlineView,
         }
         
         if let sidebarItem = item as? SidebarItem, sidebarItem.type == .Inbox {
+            maybeProject = Storage.shared().getDefault()
+        }
+
+        if isTreeMode, item == nil {
             maybeProject = Storage.shared().getDefault()
         }
 
@@ -312,7 +364,19 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+        if let note = item as? Note {
+            let pbItem = NSPasteboardItem()
+            if let data = try? NSKeyedArchiver.archivedData(withRootObject: [note.url], requiringSecureCoding: true) {
+                pbItem.setData(data, forType: NSPasteboard.note)
+            }
+            if let url = note.getContentFileURL() {
+                pbItem.setString(url.absoluteString, forType: .fileURL)
+            }
+            return pbItem
+        }
+
         guard let project = item as? Project, getSidebarTags() == nil else { return nil }
+        if isTreeMode && project.isTrash { return nil }
 
         let item = NSPasteboardItem()
         item.setString(project.url.path, forType: NSPasteboard.project)
@@ -321,6 +385,37 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
+        if isTreeMode, info.draggingPasteboard.string(forType: NSPasteboard.project) == nil {
+            // Notes / files: always drop *on* a folder (a note target means its folder, root means default)
+            var target: Project? = item as? Project
+            if let note = item as? Note { target = note.project }
+            if let project = target, project.isDefault { target = nil }
+
+            // Folders never become subfolders: they are dropped at the root
+            let fileURLs = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            if fileURLs.contains(where: { $0.hasDirectoryPath && $0.pathExtension != "textbundle" }) { target = nil }
+
+            outlineView.setDropItem(target, dropChildIndex: NSOutlineViewDropOnItemIndex)
+
+            if info.draggingPasteboard.data(forType: NSPasteboard.note) != nil {
+                return .move
+            }
+            return .copy
+        }
+
+        if isTreeMode, !(viewDelegate?.search.stringValue.isEmpty ?? true) {
+            return NSDragOperation()
+        }
+
+        if isTreeMode, let path = info.draggingPasteboard.string(forType: NSPasteboard.project) {
+            guard let project = Storage.shared().getProjectBy(url: URL(fileURLWithPath: path)),
+                  let target = treeReorderTarget(project: project, parent: item, childIndex: index) else {
+                return NSDragOperation()
+            }
+            outlineView.setDropItem(item, dropChildIndex: target)
+            return .move
+        }
+
         if let archivedData = info.draggingPasteboard.string(forType: NSPasteboard.project) {
             let url = URL(fileURLWithPath: archivedData)
             
@@ -391,6 +486,12 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        if isTreeMode {
+            if item == nil { return treeRoot.count }
+            if let project = item as? Project { return treeChildren[ObjectIdentifier(project)]?.count ?? 0 }
+            return 0
+        }
+
         if let tag = item as? FSTag {
             return tag.child.count
         }
@@ -421,6 +522,13 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        if isTreeMode {
+            if let project = item as? Project {
+                return !(treeChildren[ObjectIdentifier(project)]?.isEmpty ?? true)
+            }
+            return false
+        }
+
         if let tag = item as? FSTag {
             return tag.isExpandable()
         }
@@ -433,6 +541,14 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        if isTreeMode {
+            if item == nil, treeRoot.indices.contains(index) { return treeRoot[index] }
+            if let project = item as? Project, let list = treeChildren[ObjectIdentifier(project)], list.indices.contains(index) {
+                return list[index]
+            }
+            return String()
+        }
+
         if let tag = item as? FSTag {
             return tag.child[index]
         }
@@ -457,6 +573,27 @@ class SidebarOutlineView: NSOutlineView,
         let cell = outlineView.makeView(withIdentifier: NSUserInterfaceItemIdentifier(rawValue: "DataCell"), owner: self) as! SidebarCellView
 
         cell.icon.contentTintColor = NSColor.controlAccentColor
+        cell.label.isEditable = false
+
+        if let note = item as? Note {
+            cell.type = .Label
+            let image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)
+            image?.isTemplate = true
+            cell.icon.image = image
+            cell.icon.contentTintColor = NSColor.secondaryLabelColor
+            cell.icon.isHidden = false
+            cell.label.frame.origin.x = 25
+            var title = note.getTitle() ?? ""
+            if title.isEmpty {
+                if !note.isLoaded { note.load() }
+                note.loadPreviewInfo()
+                title = note.getTitle() ?? note.getName()
+            }
+            if title.isEmpty { title = note.getFileName() }
+            cell.textField?.stringValue = title
+            cell.toolTip = nil
+            return cell
+        }
 
         if let tag = item as? FSTag {
             cell.type = .Tag
@@ -487,6 +624,14 @@ class SidebarOutlineView: NSOutlineView,
 
                     cell.icon.image = image
                 }
+            } else if isTreeMode && project.isTrash {
+                cell.type = .Project
+
+                let image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+                image?.isTemplate = true
+
+                cell.icon.image = image
+                cell.icon.contentTintColor = NSColor.secondaryLabelColor
             } else {
                 cell.type = .Project
 
@@ -498,7 +643,9 @@ class SidebarOutlineView: NSOutlineView,
             
             cell.icon.isHidden = false
             cell.label.frame.origin.x = 25
-            cell.textField?.stringValue = project.label
+            cell.textField?.stringValue = isTreeMode && project.isTrash
+                ? NSLocalizedString("Trash", comment: "Sidebar label")
+                : project.label
 
         } else if let si = item as? SidebarItem {
             let name = si.type == .Separator ? "" : si.name
@@ -533,6 +680,10 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        if item is Note {
+            return true
+        }
+
         if nil != item as? FSTag {
             return true
         }
@@ -564,6 +715,11 @@ class SidebarOutlineView: NSOutlineView,
         
         guard let vd = viewDelegate else { return }
         guard let view = notification.object as? NSOutlineView else { return }
+
+        if isTreeMode {
+            treeSelectionDidChange(vc: vd)
+            return
+        }
 
         viewDelegate?.notesTableView.disableLockedProject()
         
@@ -763,7 +919,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     private func delete(project: Project) {
-        guard let vc = ViewController.shared() else { return }
+        guard let vc = ViewController.shared(), !project.isTrash else { return }
 
         if !(project.isDefault || project.isBookmark) {
             guard let window = MainWindowController.shared() else { return }
@@ -1076,7 +1232,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func removeTags(notes: [Note]) {
-        guard let vc = ViewController.shared() else { return }
+        guard !isTreeMode, let vc = ViewController.shared() else { return }
 
         var allNoteTags: Set<String> = []
         for note in vc.notesTableView.getNoteList() {
@@ -1105,6 +1261,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func insertTags(note: Note) {
+        guard !isTreeMode else { return }
         var tags = [String]()
         for tag in note.tags {
             if !tags.contains(tag) {
@@ -1187,6 +1344,14 @@ class SidebarOutlineView: NSOutlineView,
     public func remove(project: Project) {
         selectedProjects?.removeAll(where: { $0 === project })
 
+        if isTreeMode {
+            storage.cleanCachedTree(url: project.url)
+            storage.removeBy(project: project)
+            project.parent?.child.removeAll(where: { $0 === project })
+            scheduleTreeReload(rebuildRoot: true)
+            return
+        }
+
         if UserDataService.instance.lastProject?.path == project.url.path {
             self.viewDelegate?.cleanSearchAndEditArea()
             selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
@@ -1217,6 +1382,12 @@ class SidebarOutlineView: NSOutlineView,
         }
         
         storage.loadProjectRelations()
+
+        if isTreeMode {
+            reloadTree(rebuildRoot: true)
+            // New folders bring their notes: refresh the (hidden) notes table, the tree follows
+            viewDelegate?.updateTable()
+        }
     }
     
     public func removeRows(projects: [Project]) {
@@ -1248,6 +1419,12 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     public func insert(project: Project) {
+        if isTreeMode {
+            // insertRows(projects:) reloads the tree once relations are loaded
+            viewDelegate?.fsManager?.reloadObservedFolders()
+            return
+        }
+
         guard let vc = ViewController.shared(),
               vc.isVisibleSidebar(),
               let lastProjectIndex = vc.sidebarOutlineView.getProjectsSeparatorPosition() else { return }
@@ -1326,6 +1503,16 @@ class SidebarOutlineView: NSOutlineView,
             if let project = item(atRow: i) as? Project {
                 projects.append(project)
             }
+
+            // Tree explorer: a selected note stands for its folder (e.g. new note goes next to it)
+            if isTreeMode, let note = item(atRow: i) as? Note, !projects.contains(where: { $0 === note.project }) {
+                projects.append(note.project)
+            }
+        }
+
+        // Tree explorer: Trash is never a target (new notes/folders go to the root instead)
+        if isTreeMode {
+            projects.removeAll(where: { $0.isTrash })
         }
 
         for project in projects {
@@ -1483,6 +1670,11 @@ class SidebarOutlineView: NSOutlineView,
         vc.fsManager?.reloadObservedFolders()
         vc.loadMoveMenu()
 
+        if isTreeMode {
+            reloadTree(rebuildRoot: true)
+            return
+        }
+
         let selected = vc.sidebarOutlineView.selectedRow
         vc.sidebarOutlineView.sidebarItems = Sidebar().getList()
         vc.sidebarOutlineView.reloadData()
@@ -1520,6 +1712,12 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func select(note: Note) {
+        if isTreeMode {
+            viewDelegate?.notesTableView.setSelected(note: note)
+            revealInTree(note: note)
+            return
+        }
+
         let sidebarItem = sidebarItems?.first(where: {($0 as? SidebarItem)?.project == note.project || $0 as? Project == note.project })
 
         var index = row(forItem: sidebarItem)
@@ -1555,6 +1753,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func remove(tagName: String) {
+        guard !isTreeMode else { return }
         let tags = tagName.components(separatedBy: "/")
         guard let parent = tags.first else { return }
         
@@ -1600,6 +1799,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func addTags(_ tags: [String], shouldUnloadOld: Bool = false) {
+        guard !isTreeMode else { return }
         guard tags.count > 0 else {
             unloadAllTags()
             return
@@ -1619,6 +1819,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func removeTags(_ tags: [String]) {
+        guard !isTreeMode else { return }
         var removeTags = [String]()
 
         for tag in tags {
@@ -1654,6 +1855,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func unloadAllTags() {
+        guard !isTreeMode else { return }
         if let tags = sidebarItems?.filter({ ($0 as? FSTag) != nil && ($0 as? FSTag)?.getParent()
              == nil }) as? [FSTag] {
             beginUpdates()
@@ -1750,6 +1952,7 @@ class SidebarOutlineView: NSOutlineView,
     }
 
     public func addTag(tag: String) {
+        guard !isTreeMode else { return }
         guard let vc = ViewController.shared(), vc.isVisibleSidebar() else { return }
         
         var subtags = tag.components(separatedBy: "/")
@@ -1977,8 +2180,9 @@ class SidebarOutlineView: NSOutlineView,
     }
     
     public func createProject(in project: Project? = nil, with name: String) -> Project? {
+        // Tree explorer: no subfolders, new folders always go to the storage root
         guard let vc = ViewController.shared(),
-              let project = project ?? Storage.shared().getDefault() else { return nil }
+              let project = isTreeMode ? Storage.shared().getDefault() : (project ?? Storage.shared().getDefault()) else { return nil }
         
         var insertedProject: Project?
         
@@ -2026,5 +2230,396 @@ class SidebarOutlineView: NSOutlineView,
             byExtendingSelection: false
         )
         vc.sidebarOutlineView.scrollRowToVisible(row)
+    }
+}
+
+// MARK: - Tree explorer (folders + notes in one column, Obsidian-like)
+
+extension SidebarOutlineView {
+
+    /// Rebuilds the folder → notes model from the (hidden) notes table, which stays the source of truth.
+    private func rebuildTreeModel(rebuildRoot: Bool) {
+        if rebuildRoot || sidebarItems == nil {
+            sidebarItems = Sidebar().getList()
+        }
+
+        let notes = viewDelegate?.notesTableView.getNoteList() ?? []
+        let filtering = !(viewDelegate?.search.stringValue.isEmpty ?? true)
+
+        var byProject = [ObjectIdentifier: [Note]]()
+        var rootNotes = [Note]()
+
+        for note in notes {
+            if note.project.isDefault {
+                rootNotes.append(note)
+            } else {
+                byProject[ObjectIdentifier(note.project), default: []].append(note)
+            }
+        }
+
+        func hasContent(_ project: Project) -> Bool {
+            byProject[ObjectIdentifier(project)] != nil
+        }
+
+        // Two levels only: top-level folders and their notes (subfolders are not shown)
+        var children = [ObjectIdentifier: [Any]]()
+        func build(_ project: Project) {
+            children[ObjectIdentifier(project)] = byProject[ObjectIdentifier(project)] ?? []
+        }
+
+        let rootProjects = (sidebarItems ?? [])
+            .compactMap { $0 as? Project }
+            .filter { !$0.isTrash && (!filtering || hasContent($0)) }
+
+        rootProjects.forEach { build($0) }
+
+        // Trash (deleted notes) at the bottom, hidden while searching
+        var trashRow = [Any]()
+        if !filtering, let trash = Storage.shared().getDefaultTrash() {
+            children[ObjectIdentifier(trash)] = byProject[ObjectIdentifier(trash)] ?? []
+            trashRow = [trash]
+        }
+
+        treeChildren = children
+        treeRoot = rootProjects + rootNotes + trashRow
+    }
+
+    private func currentTreeSignature() -> [ObjectIdentifier] {
+        var result = [ObjectIdentifier]()
+        func walk(_ items: [Any]) {
+            for item in items {
+                if let object = item as AnyObject? {
+                    result.append(ObjectIdentifier(object))
+                }
+                if let project = item as? Project, let list = treeChildren[ObjectIdentifier(project)] {
+                    walk(list)
+                }
+            }
+        }
+        walk(treeRoot)
+        return result
+    }
+
+    public func scheduleTreeReload(rebuildRoot: Bool = false) {
+        guard isTreeMode else { return }
+
+        pendingRootRebuild = pendingRootRebuild || rebuildRoot
+        treeReloadWork?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let root = self.pendingRootRebuild
+            self.pendingRootRebuild = false
+            self.reloadTree(rebuildRoot: root)
+        }
+        treeReloadWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+    }
+
+    public func reloadTree(rebuildRoot: Bool = false) {
+        guard isTreeMode else { return }
+
+        rebuildTreeModel(rebuildRoot: rebuildRoot)
+
+        let signature = currentTreeSignature()
+        isTreeSyncing = true
+        defer { isTreeSyncing = false }
+
+        if signature == treeSignature && !rebuildRoot {
+            // Same structure: refresh titles only
+            if numberOfRows > 0 {
+                reloadData(forRowIndexes: IndexSet(integersIn: 0..<numberOfRows), columnIndexes: [0])
+            }
+            return
+        }
+
+        let previouslySelected = selectedRowIndexes.compactMap { item(atRow: $0) as AnyObject? }
+
+        treeSignature = signature
+        reloadData()
+
+        // Restore expansion: saved state normally, everything while searching.
+        // Uses NSOutlineView's implementation directly so search-only expansion is not persisted.
+        let filtering = !(viewDelegate?.search.stringValue.isEmpty ?? true)
+        var i = 0
+        while i < numberOfRows {
+            if let project = item(atRow: i) as? Project,
+               (filtering || project.isExpanded),
+               isExpandable(project), !isItemExpanded(project) {
+                super.expandItem(project, expandChildren: false)
+            }
+            i += 1
+        }
+
+        // Restore selection (same objects), then mirror the opened note
+        var rows = IndexSet()
+        for object in previouslySelected {
+            let r = row(forItem: object)
+            if r > -1 { rows.insert(r) }
+        }
+        if rows.isEmpty {
+            deselectAll(nil)
+        } else {
+            super.selectRowIndexes(rows, byExtendingSelection: false)
+        }
+
+        if !previouslySelected.contains(where: { $0 is Project }) {
+            syncTreeSelection()
+        }
+
+        restorePendingNote()
+    }
+
+    /// Reopens the note from the last session once it is present in the notes table.
+    public func restorePendingNote() {
+        guard let url = pendingRestoreURL, let table = viewDelegate?.notesTableView else { return }
+
+        if table.selectedRow >= 0 {
+            pendingRestoreURL = nil
+            return
+        }
+
+        guard let note = storage.getBy(url: url), let i = table.getIndex(for: note) else { return }
+
+        pendingRestoreURL = nil
+        table.selectRowIndexes([i], byExtendingSelection: false)
+        table.scrollRowToVisible(i)
+    }
+
+    /// Mirror the notes table selection (the opened note) in the tree.
+    public func syncTreeSelection() {
+        guard isTreeMode, let table = viewDelegate?.notesTableView else { return }
+
+        let notes = table.getSelectedNotes() ?? []
+        guard !notes.isEmpty else { return }
+
+        let wasSyncing = isTreeSyncing
+        isTreeSyncing = true
+        defer { isTreeSyncing = wasSyncing }
+
+        var rows = IndexSet()
+        for note in notes {
+            revealInTree(note: note, select: false)
+            let r = row(forItem: note)
+            if r > -1 { rows.insert(r) }
+        }
+
+        guard !rows.isEmpty, rows != selectedRowIndexes else { return }
+
+        super.selectRowIndexes(rows, byExtendingSelection: false)
+        if let first = rows.first {
+            scrollRowToVisible(first)
+        }
+    }
+
+    public func revealInTree(note: Note, select: Bool = true) {
+        guard isTreeMode else { return }
+
+        var chain = [Project]()
+        var project: Project? = note.project
+        while let p = project, !p.isDefault {
+            chain.append(p)
+            project = p.parent
+        }
+
+        for p in chain.reversed() where row(forItem: p) > -1 && !isItemExpanded(p) {
+            expandItem(p)
+        }
+
+        if select {
+            let r = row(forItem: note)
+            if r > -1 {
+                isTreeSyncing = true
+                super.selectRowIndexes([r], byExtendingSelection: false)
+                isTreeSyncing = false
+                scrollRowToVisible(r)
+            }
+        }
+    }
+
+    /// Selecting notes in the tree selects them in the hidden notes table → editor opens them.
+    func treeSelectionDidChange(vc: ViewController) {
+        guard !isTreeSyncing else { return }
+
+        let notes = selectedRowIndexes.compactMap { item(atRow: $0) as? Note }
+        guard !notes.isEmpty, let table = vc.notesTableView else { return }
+
+        var indexes = IndexSet()
+        for note in notes {
+            if let i = table.getIndex(for: note) {
+                indexes.insert(i)
+            }
+        }
+
+        guard !indexes.isEmpty, indexes != table.selectedRowIndexes else { return }
+
+        UserDataService.instance.searchTrigger = false
+
+        if let first = indexes.first {
+            table.saveNavigationHistory(note: table.getNoteList()[first])
+        }
+
+        table.selectRowIndexes(indexes, byExtendingSelection: false)
+        table.scrollRowToVisible(indexes.first ?? 0)
+    }
+
+    func treeMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+        let onDisclosure = clickedRow >= 0 && frameOfOutlineCell(atRow: clickedRow).insetBy(dx: -4, dy: 0).contains(point)
+
+        superMouseDown(with: event)
+
+        guard clickedRow >= 0, !onDisclosure, event.clickCount == 1,
+              !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.shift),
+              let project = item(atRow: clickedRow) as? Project else { return }
+
+        // Ignore drags
+        if let up = NSApp.currentEvent, up.type == .leftMouseUp || up.type == .leftMouseDragged {
+            let upPoint = convert(up.locationInWindow, from: nil)
+            if abs(upPoint.x - point.x) > 4 || abs(upPoint.y - point.y) > 4 { return }
+        }
+
+        if project.isEncrypted && project.isLocked() {
+            toggleFolderLock(NSMenuItem())
+            return
+        }
+
+        guard isExpandable(project) else { return }
+
+        if isItemExpanded(project) {
+            collapseItem(project)
+        } else {
+            expandItem(project)
+        }
+    }
+
+    /// Returns true when the event was handled.
+    func treeKeyDown(with event: NSEvent) -> Bool {
+        guard let vc = viewDelegate else { return false }
+
+        let current = selectedRow >= 0 ? item(atRow: selectedRow) : nil
+
+        switch Int(event.keyCode) {
+        case kVK_Return, kVK_ANSI_KeypadEnter:
+            if current is Note {
+                vc.focusEditArea()
+                return true
+            }
+            if let project = current as? Project {
+                if project.isEncrypted && project.isLocked() {
+                    toggleFolderLock(NSMenuItem())
+                } else if isItemExpanded(project) {
+                    collapseItem(project)
+                } else {
+                    expandItem(project)
+                }
+                return true
+            }
+        case kVK_RightArrow:
+            if current is Note {
+                vc.focusEditArea()
+                return true
+            }
+            if let project = current as? Project {
+                if project.isEncrypted && project.isLocked() {
+                    toggleFolderLock(NSMenuItem())
+                    return true
+                }
+                super.keyDown(with: event)
+                return true
+            }
+        case kVK_LeftArrow:
+            if let note = current as? Note {
+                let parentItem = parent(forItem: note)
+                let r = row(forItem: parentItem)
+                if r > -1 {
+                    selectRowIndexes([r], byExtendingSelection: false)
+                    scrollRowToVisible(r)
+                }
+                return true
+            }
+            if current is Project {
+                super.keyDown(with: event)
+                return true
+            }
+        default:
+            break
+        }
+
+        return false
+    }
+}
+
+
+// MARK: - Tree drag helpers
+
+extension SidebarOutlineView {
+    /// Note URLs from every pasteboard item (the tree writes one item per note;
+    /// the notes table writes one item holding several URLs).
+    static func draggedNoteURLs(_ board: NSPasteboard) -> [URL] {
+        var urls = [URL]()
+        var seen = Set<URL>()
+        let datas = (board.pasteboardItems ?? []).compactMap { $0.data(forType: NSPasteboard.note) }
+        for data in datas {
+            guard let list = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, NSURL.self], from: data) as? [URL] else { continue }
+            for url in list where !seen.contains(url) {
+                seen.insert(url)
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
+    /// Folders shown next to `project` in the tree (the reorder siblings), or nil
+    /// when `parent` is not the project's own level.
+    fileprivate func treeSiblingFolders(of project: Project, parent: Any?) -> [Project]? {
+        let list: [Any]
+        if let parentProject = parent as? Project {
+            guard parentProject === project.parent else { return nil }
+            list = treeChildren[ObjectIdentifier(parentProject)] ?? []
+        } else {
+            guard parent == nil, treeRoot.contains(where: { ($0 as? Project) === project }) else { return nil }
+            list = treeRoot
+        }
+        return list.compactMap { $0 as? Project }.filter { !$0.isTrash }
+    }
+
+    /// Valid drop index among the displayed folders (folders come before notes, so an
+    /// index in the notes part means "after the last folder"); nil for a no-op or invalid drop.
+    func treeReorderTarget(project: Project, parent: Any?, childIndex: Int) -> Int? {
+        guard childIndex >= 0, let folders = treeSiblingFolders(of: project, parent: parent),
+              let src = folders.firstIndex(where: { $0 === project }) else { return nil }
+        let target = min(childIndex, folders.count)
+        if target == src || target == src + 1 { return nil }
+        return target
+    }
+
+    func treeReorder(project: Project, parent: Any?, childIndex: Int) -> Bool {
+        guard let target = treeReorderTarget(project: project, parent: parent, childIndex: childIndex),
+              var folders = treeSiblingFolders(of: project, parent: parent),
+              let src = folders.firstIndex(where: { $0 === project }) else { return false }
+
+        folders.remove(at: src)
+        folders.insert(project, at: target > src ? target - 1 : target)
+
+        // Keep the model order in sync (hidden folders keep their relative place at the end)
+        if let parentProject = parent as? Project {
+            let hidden = parentProject.child.filter { child in !folders.contains(where: { $0 === child }) }
+            parentProject.child = folders + hidden
+        } else if let items = sidebarItems {
+            let others = items.filter { item in !folders.contains(where: { $0 === (item as? Project) }) }
+            sidebarItems = folders + others
+        }
+
+        var i = 0
+        for folder in folders {
+            folder.settings.priority = i
+            folder.saveSettings()
+            i += 1
+        }
+
+        reloadTree()
+        return true
     }
 }

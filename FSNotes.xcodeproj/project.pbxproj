@@ -730,6 +730,8 @@
 		D7D2F27E2B54BD42003DCA47 /* Shout in Frameworks */ = {isa = PBXBuildFile; productRef = D7D2F27D2B54BD42003DCA47 /* Shout */; };
 		D7D2F2802B54BDD4003DCA47 /* Shout in Frameworks */ = {isa = PBXBuildFile; productRef = D7D2F27F2B54BDD4003DCA47 /* Shout */; };
 		D7D2F2822B54BE59003DCA47 /* Shout in Frameworks */ = {isa = PBXBuildFile; productRef = D7D2F2812B54BE59003DCA47 /* Shout */; };
+		5A7E00000000000000000004 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 5A7E00000000000000000002 /* SwiftMath */; };
+		5A7E00000000000000000005 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 5A7E00000000000000000003 /* SwiftMath */; };
 		D7D372F4207B5B0F00AFBD9F /* SidebarNotesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7D372F3207B5B0F00AFBD9F /* SidebarNotesView.swift */; };
 		D7D372F5207B5B0F00AFBD9F /* SidebarNotesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7D372F3207B5B0F00AFBD9F /* SidebarNotesView.swift */; };
 		D7D372F7207BB09500AFBD9F /* SidebarOutlineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7D372F6207BB09500AFBD9F /* SidebarOutlineView.swift */; };
@@ -1413,6 +1415,7 @@
 				11E000000000000000000002 /* RNCryptor in Frameworks */,
 				11E000000000000000000003 /* ZipArchive in Frameworks */,
 				D7D2F2822B54BE59003DCA47 /* Shout in Frameworks */,
+				5A7E00000000000000000004 /* SwiftMath in Frameworks */,
 				D70F830628CE8596004818C5 /* Git in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1425,6 +1428,7 @@
 				11E000000000000000000005 /* RNCryptor in Frameworks */,
 				11E000000000000000000006 /* ZipArchive in Frameworks */,
 				D7D2F27E2B54BD42003DCA47 /* Shout in Frameworks */,
+				5A7E00000000000000000005 /* SwiftMath in Frameworks */,
 				D70F830428CE858E004818C5 /* Git in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -2277,6 +2281,7 @@
 				11D000000000000000000003 /* ZipArchive */,
 				D70F830528CE8596004818C5 /* Git */,
 				D7D2F2812B54BE59003DCA47 /* Shout */,
+				5A7E00000000000000000002 /* SwiftMath */,
 			);
 			productName = FSNotes;
 			productReference = D7793C6F1F211C6000CA39B7 /* FSNotes.app */;
@@ -2306,6 +2311,7 @@
 				11D000000000000000000006 /* ZipArchive */,
 				D70F830328CE858E004818C5 /* Git */,
 				D7D2F27D2B54BD42003DCA47 /* Shout */,
+				5A7E00000000000000000003 /* SwiftMath */,
 			);
 			productName = FSNotes;
 			productReference = D7E81C5A1F925B5F00416A91 /* FSNotes.app */;
@@ -2429,6 +2435,7 @@
 				11C000000000000000000006 /* XCRemoteSwiftPackageReference "TOCropViewController" */,
 				D7B4CC5428C7B8860046A25F /* XCRemoteSwiftPackageReference "swift-git" */,
 				D7D2F27C2B54BD42003DCA47 /* XCRemoteSwiftPackageReference "Shout" */,
+				5A7E00000000000000000001 /* XCRemoteSwiftPackageReference "SwiftMath" */,
 			);
 			productRefGroup = D7793C701F211C6000CA39B7 /* Products */;
 			projectDirPath = "";
@@ -4169,6 +4176,14 @@
 				kind = branch;
 			};
 		};
+		5A7E00000000000000000001 /* XCRemoteSwiftPackageReference "SwiftMath" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mgriebling/SwiftMath.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -4281,6 +4296,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D7D2F27C2B54BD42003DCA47 /* XCRemoteSwiftPackageReference "Shout" */;
 			productName = Shout;
+		};
+		5A7E00000000000000000002 /* SwiftMath */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5A7E00000000000000000001 /* XCRemoteSwiftPackageReference "SwiftMath" */;
+			productName = SwiftMath;
+		};
+		5A7E00000000000000000003 /* SwiftMath */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5A7E00000000000000000001 /* XCRemoteSwiftPackageReference "SwiftMath" */;
+			productName = SwiftMath;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -196,6 +196,12 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
                     break
                     
                 case "view.toggleNoteList":
+                    if UserDefaultsManagement.treeExplorer {
+                        menuItem.title = vc.isVisibleSidebar()
+                            ? NSLocalizedString("Hide Explorer", comment: "")
+                            : NSLocalizedString("Show Explorer", comment: "")
+                        break
+                    }
                     menuItem.title = vc.isVisibleNoteList()
                     ? NSLocalizedString("Hide Note List", comment: "")
                     : NSLocalizedString("Show Note List", comment: "")
@@ -878,7 +884,8 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
         guard let vc = ViewController.shared() else { return }
         
         let si = vc.getSidebarItem()
-        if si?.isTrash() == true || forceRemove {
+        // Notes already in Trash (tree explorer lists them too) are deleted for good: confirm first
+        if si?.isTrash() == true || forceRemove || notes.contains(where: { $0.isTrash() }) {
             vc.removeForever()
             
             // Call from window, close it!
@@ -910,6 +917,14 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
         }
         
         vc.storage.removeNotes(notes: notes) { urlMapping in
+            // Tree explorer: show the moved files under Trash right away
+            if UserDefaultsManagement.treeExplorer, let trashURLs = urlMapping?.keys {
+                let trashed = trashURLs.compactMap { vc.storage.getBy(url: $0) ?? vc.storage.importNote(url: $0) }
+                DispatchQueue.main.async {
+                    vc.notesTableView.insertRows(notes: trashed)
+                }
+            }
+
             if let md = AppDelegate.mainWindowController {
                 let undoManager = md.notesListUndoManager
                 if let ntv = vc.notesTableView {

@@ -28,12 +28,13 @@ extension ViewController {
         let projectSelected = projects?.isEmpty == false
         let tagSelected = tags?.isEmpty == false
         
-        let isFirstSidebar = evc.view.window?.firstResponder?.isKind(of: SidebarOutlineView.self) == true
+        let isFirstSidebar = evc.view.window?.firstResponder?.isKind(of: SidebarOutlineView.self) == true && !vc.isTreeNoteFocused
         let isInbox = vc.sidebarOutlineView.getSidebarItems()?.first?.type == .Inbox
         let isTrash = vc.sidebarOutlineView.getSidebarItems()?.first?.type == .Trash
+            || projects?.first?.isTrash == true
         
         // Notes
-        let isFirstResponder = evc.view.window?.firstResponder?.isKind(of: NotesTableView.self) == true
+        let isFirstResponder = evc.view.window?.firstResponder?.isKind(of: NotesTableView.self) == true || vc.isTreeNoteFocused
         let isFirstEditor = evc.view.window?.firstResponder?.isKind(of: EditTextView.self) == true
         let isOpenedWindow = NSApplication.shared.keyWindow?.contentViewController?.isKind(of: NoteViewController.self) == true
         
@@ -109,7 +110,7 @@ extension ViewController {
                     menuItem.title = NSLocalizedString("Rename Folder", comment: "Menu Library")
                 }
                 
-                return projectSelected || tagSelected
+                return (projectSelected || tagSelected) && !isTrash
             }
             
             menuItem.title = NSLocalizedString("Rename", comment: "File Menu")
@@ -217,7 +218,7 @@ extension ViewController {
               let evc = NSApplication.shared.keyWindow?.contentViewController as? EditorViewController,
               let id = menuItem.identifier?.rawValue else { return false }
         
-        let isFirstResponder = evc.view.window?.firstResponder?.isKind(of: NotesTableView.self) == true
+        let isFirstResponder = evc.view.window?.firstResponder?.isKind(of: NotesTableView.self) == true || vc.isTreeNoteFocused
         let isFirstEditor = evc.view.window?.firstResponder?.isKind(of: EditTextView.self) == true
         let isOpenedWindow = NSApplication.shared.keyWindow?.contentViewController?.isKind(of: NoteViewController.self) == true
         
@@ -262,9 +263,10 @@ extension ViewController {
         
         let projectSelected = projects?.isEmpty == false
         let tagSelected = tags?.isEmpty == false
-        let isFirstResponder = view.window?.firstResponder?.isKind(of: SidebarOutlineView.self) == true
+        let isFirstResponder = view.window?.firstResponder?.isKind(of: SidebarOutlineView.self) == true && !vc.isTreeNoteFocused
         
         let isTrash = vc.sidebarOutlineView.getSidebarItems()?.first?.type == .Trash
+            || projects?.first?.isTrash == true
         let isInbox = vc.sidebarOutlineView.getSidebarItems()?.first?.type == .Inbox
         let isSystem = vc.sidebarOutlineView.getSidebarItems()?.first?.isSystem() == true
         
@@ -279,7 +281,7 @@ extension ViewController {
             } else {
                 menuItem.title = NSLocalizedString("Rename Folder", comment: "Menu Library")
             }
-            return isFirstResponder && (projectSelected || tagSelected)
+            return isFirstResponder && (projectSelected || tagSelected) && !isTrash
             
         case "\(menuId).delete":
             if let project = projects?.first, project.isBookmark {
@@ -289,7 +291,7 @@ extension ViewController {
             } else {
                 menuItem.title = NSLocalizedString("Delete Folder", comment: "Menu Library")
             }
-            return isFirstResponder && (projectSelected || tagSelected)
+            return isFirstResponder && (projectSelected || tagSelected) && !isTrash
             
         case "\(menuId).decrypt":
             menuItem.title = NSLocalizedString("Decrypt Folder", comment: "Menu Library")
@@ -303,7 +305,7 @@ extension ViewController {
             } else {
                 menuItem.title = NSLocalizedString("Lock Folder", comment: "Menu Library")
             }
-            return isFirstResponder && projectSelected
+            return isFirstResponder && projectSelected && !isTrash
             
         case "\(menuId).reveal":
             menuItem.title = NSLocalizedString("Reveal in Finder", comment: "Menu Library")
@@ -351,6 +353,11 @@ extension ViewController {
         let projects = storage.getSortedProjects()
         for item in projects {
             if note.project == item || item.isTrash {
+                continue
+            }
+
+            // Tree explorer: only the folders it shows
+            if UserDefaultsManagement.treeExplorer && !item.isTopLevel {
                 continue
             }
             

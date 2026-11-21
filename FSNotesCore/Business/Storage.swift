@@ -132,9 +132,13 @@ class Storage {
             }
         }
 
-        // Cached
+        // Cached (only folders that still exist inside the notes folder or an external folder)
         if let urls = getCachedTree() {
+            let roots = projects.filter { $0.isDefault || $0.isBookmark }.map { $0.url.standardized.path + "/" }
             for url in urls {
+                let path = url.standardized.path
+                guard FileManager.default.fileExists(atPath: path),
+                      roots.contains(where: { path.hasPrefix($0) }) else { continue }
                 _ = insert(url: url, cacheOnly: true)
             }
         }
@@ -250,6 +254,19 @@ class Storage {
     }
 
     public func getCacheDir() -> URL? {
+        #if os(OSX)
+        // Without the sandbox every FSNotes build shares ~/Library/Caches: keep a folder per
+        // app, or builds pointed at different notes folders mix their cached folder trees.
+        if ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] == nil,
+           let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let url = caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "FSNotes", isDirectory: true)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            }
+            return url
+        }
+        #endif
+
         guard let cacheDir = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first, let url = URL(string: "file://" + cacheDir)
         else { return nil }
 
@@ -1042,10 +1059,7 @@ class Storage {
     }
 
     public func getCache(key: String) -> Data? {
-        guard let cacheDir =
-            NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first else { return nil }
-
-        guard let url = URL(string: "file://" + cacheDir) else { return nil }
+        guard let url = getCacheDir() else { return nil }
 
         let cacheURL = url.appendingPathComponent(key + ".cache")
         

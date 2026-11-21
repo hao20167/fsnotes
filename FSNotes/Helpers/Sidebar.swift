@@ -17,6 +17,12 @@ class Sidebar {
     init() {
         guard let defaultURL = Storage.shared().getDefault()?.url else { return }
 
+        // Tree explorer: only real folders (root notes are appended by the outline view)
+        if UserDefaultsManagement.treeExplorer {
+            list = storage.getSidebarProjects()
+            return
+        }
+
         var system = [SidebarItem]()
 
         if UserDefaultsManagement.sidebarVisibilityNotes {

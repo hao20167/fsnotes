@@ -33,6 +33,34 @@ class NotesTableView: NSTableView,
         wantsLayer = true
     }
     
+    // MARK: Tree explorer sync (the tree groups this table's notes by folder)
+
+    private func notifyTree() {
+        guard UserDefaultsManagement.treeExplorer,
+              let vc = self.window?.contentViewController as? ViewController ?? ViewController.shared() else { return }
+        vc.sidebarOutlineView?.scheduleTreeReload()
+    }
+
+    override func reloadData() {
+        super.reloadData()
+        notifyTree()
+    }
+
+    override func insertRows(at indexes: IndexSet, withAnimation animationOptions: NSTableView.AnimationOptions = []) {
+        super.insertRows(at: indexes, withAnimation: animationOptions)
+        notifyTree()
+    }
+
+    override func removeRows(at indexes: IndexSet, withAnimation animationOptions: NSTableView.AnimationOptions = []) {
+        super.removeRows(at: indexes, withAnimation: animationOptions)
+        notifyTree()
+    }
+
+    override func moveRow(at oldIndex: Int, to newIndex: Int) {
+        super.moveRow(at: oldIndex, to: newIndex)
+        notifyTree()
+    }
+
     override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         if item.action == #selector(selectAll(_:)) {
             return numberOfRows > 0 && allowsMultipleSelection
@@ -257,6 +285,10 @@ class NotesTableView: NSTableView,
             vc.sidebarOutlineView.reloadTags()
             vc.editor.clear()
             return
+        }
+
+        if UserDefaultsManagement.treeExplorer {
+            vc.sidebarOutlineView.syncTreeSelection()
         }
 
         // Select row
@@ -596,6 +628,10 @@ class NotesTableView: NSTableView,
         for (src, dst) in urls {
             do {
                 if let note = storage.getBy(url: src) {
+                    // Tree explorer lists trashed notes: drop the Trash row being restored
+                    if UserDefaultsManagement.treeExplorer {
+                        removeRows(notes: [note])
+                    }
                     storage.removeBy(note: note)
                     if let destination = Storage.shared().getProjectByNote(url: dst) {
                         note.moveImages(to: destination)
@@ -655,6 +691,7 @@ class NotesTableView: NSTableView,
 
         // Heights are cached even for rows that do not currently have a cell view.
         self.noteHeightOfRows(withIndexesChanged: [i])
+        notifyTree()
         
         if let cell = self.view(atColumn: 0, row: i, makeIfNecessary: false) as? NoteCellView {
             cell.date.stringValue = note.getDateForLabel()
@@ -710,7 +747,7 @@ class NotesTableView: NSTableView,
         }
 
         DispatchQueue.main.async {
-            if let vc = ViewController.shared(), vc.splitView.subviews[0].frame.width > 10 {
+            if let vc = ViewController.shared(), vc.splitView.subviews[0].frame.width > 10 || UserDefaultsManagement.treeExplorer {
                 self.removeRows(notes: results.0)
                 self.insertRows(notes: results.1)
                 self.reloadRows(notes: results.2)

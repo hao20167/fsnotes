@@ -23,6 +23,12 @@ public class Project: NSObject {
     public var isVirtual = false
     public var isBookmark: Bool = false
 
+    /// Storage root, an external folder, or a folder directly inside the root
+    /// (the only levels the tree explorer shows)
+    public var isTopLevel: Bool {
+        isDefault || isBookmark || parent?.isDefault == true
+    }
+
     public var settings = ProjectSettings()
 
     // all notes loaded with cache diff comparsion

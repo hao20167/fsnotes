@@ -825,6 +825,49 @@ public class UserDefaultsManagement {
         }
     }
     
+    /// Single-column Obsidian-like explorer: folders and notes in one tree.
+    static var treeExplorer: Bool {
+        get {
+            if let result = UserDefaults.standard.object(forKey: "treeExplorer") as? Bool {
+                return result
+            }
+            return true
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "treeExplorer")
+        }
+    }
+
+    /// Basic vim keybindings in the editor.
+    static var vimMode: Bool {
+        get {
+            return UserDefaults.standard.bool(forKey: "vimMode")
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "vimMode")
+        }
+    }
+
+    /// Private mode: hide note previews and every editor line except the current one.
+    /// Private mode: how many lines above and below the current line stay visible (0 = current line only).
+    static var privateModeContextLines: Int {
+        get {
+            return max(0, UserDefaults.standard.integer(forKey: "privateModeContextLines"))
+        }
+        set {
+            UserDefaults.standard.set(max(0, newValue), forKey: "privateModeContextLines")
+        }
+    }
+
+    static var privateMode: Bool {
+        get {
+            return UserDefaults.standard.bool(forKey: "privateMode")
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "privateMode")
+        }
+    }
+
     static var shouldFocusSearchOnESCKeyDown: Bool {
         get {
             if let result = UserDefaults.standard.object(forKey: Constants.shouldFocusSearchOnESCKeyDown) as? Bool {

@@ -26,6 +26,7 @@ extension NoteCellView {
 
         guard
             !UserDefaultsManagement.hidePreviewImages &&
+            !UserDefaultsManagement.privateMode &&
             !UserDefaultsManagement.horizontalOrientation else {
             hideUnusedImagesPreview()
             imageKeys = []

@@ -29,11 +29,15 @@ class SearchTextField: NSSearchField, NSSearchFieldDelegate {
         super.awakeFromNib()
 
         // Let AppKit provide the search bezel, icons, and focus appearance.
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             controlSize = .extraLarge
         } else {
             controlSize = .regular
         }
+        #else
+        controlSize = .regular
+        #endif
         
         font = .systemFont(ofSize: NSFont.systemFontSize(for: controlSize))
         if #available(macOS 26.0, *) {

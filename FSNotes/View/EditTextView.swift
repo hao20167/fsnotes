@@ -49,9 +49,18 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
             isFocused: window?.firstResponder == self
         )
 
+        // Formulas render everywhere except on the line being edited
+        let mathChanged = MathPreview.refresh(
+            in: textStorage,
+            selection: window?.firstResponder == self ? selectedRange() : nil,
+            codeBlocks: note?.codeBlockRangesCache ?? [],
+            fontSize: UserDefaultsManagement.noteFont.pointSize,
+            appearance: effectiveAppearance
+        )
+
         // Expanding a fence moves the border beyond the edited character range.
         // Redraw the whole view to erase the border at its previous position.
-        if appearanceChanged {
+        if appearanceChanged || mathChanged {
             needsDisplay = true
         }
 
@@ -63,6 +72,7 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
         typingAttributes.removeValue(forKey: NotesTextProcessor.concealedSyntaxFont)
         typingAttributes.removeValue(forKey: NotesTextProcessor.concealedSyntaxHidden)
         typingAttributes.removeValue(forKey: NotesTextProcessor.collapsedCodeFence)
+        typingAttributes.removeValue(forKey: MathPreview.key)
     }
     
     public var isScrollPositionSaverLocked = false
@@ -125,6 +135,12 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
                 guard attributes.index(forKey: .tag) != nil,
                       let font = attributes[.font] as? NSFont
                 else { return }
+
+                // Private mode: only the current line's tags are drawn
+                if let visible = (layoutManager as? LayoutManager)?.privateVisibleCharacterRange(),
+                   NSIntersectionRange(visible, range).length == 0 {
+                    return
+                }
 
                 let tag = attributedString().attributedSubstring(from: range).string
                 let tagAttributes = attributedString().attributes(at: range.location, effectiveRange: nil)
@@ -257,6 +273,11 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
     // MARK: Overrides
 
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
+        if isVimBlockCaret {
+            drawVimBlockCaret(in: rect, color: color)
+            return
+        }
+
         var newRect = rect
         newRect.size.width = caretWidth
         
@@ -303,7 +324,14 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
         }
 
         let previouslySelectedBlocks = selectedBlocks(in: selectedRanges)
+        let previousPrivateRange = (layoutManager as? LayoutManager)?.privateVisibleCharacterRange()
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: flag)
+
+        // Private mode: the visible line follows the caret
+        if let previous = previousPrivateRange,
+           previous != (layoutManager as? LayoutManager)?.privateVisibleCharacterRange() {
+            needsDisplay = true
+        }
 
         // Redraw the decoration outside the selection only when a block
         // enters or leaves the selection, including during mouse tracking.
@@ -314,7 +342,7 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
     
     override func setNeedsDisplay(_ invalidRect: NSRect) {
         var newInvalidRect = NSRect(origin: invalidRect.origin, size: invalidRect.size)
-        newInvalidRect.size.width += self.caretWidth - 1
+        newInvalidRect.size.width += isVimBlockCaret ? UserDefaultsManagement.noteFont.pointSize * 1.2 : self.caretWidth - 1
 
         super.setNeedsDisplay(newInvalidRect)
     }
@@ -894,8 +922,11 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
             editorScrollPositionBeforePreview = nil
             previewScrollRestorationID = nil
             preserveScrollPositionOnNextFocus = false
+
+            // Close the vim command/undo group on the old note's undo manager first
+            vim.noteDidChange()
         }
-        
+
         if !note.isLoaded {
             note.load()
         }
@@ -1170,6 +1201,10 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
     override func keyDown(with event: NSEvent) {
         defer {
             saveSelectedRange()
+        }
+
+        if handleVimKeyDown(event) {
+            return
         }
         
         // Insert the third Markdown fence backtick literally, but leave other backtick

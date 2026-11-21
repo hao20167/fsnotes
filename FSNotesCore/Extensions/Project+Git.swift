@@ -485,3 +485,47 @@ extension Project {
         try push()
     }
 }
+
+
+#if os(OSX)
+extension Project {
+    /// Fork migration: restore this folder's git backup settings from the files the original
+    /// app left on disk (repository config for the origin, Keys/<settingsKey> for the SSH key).
+    /// Settings already present are kept. Returns true when something was restored.
+    @discardableResult
+    public func importLegacyGitSettings() -> Bool {
+        if let origin = settings.gitOrigin, !origin.isEmpty { return false }
+
+        let config = getRepositoryUrl().appendingPathComponent("config")
+        guard let text = try? String(contentsOf: config, encoding: .utf8),
+              let origin = Project.originURL(inGitConfig: text) else { return false }
+
+        settings.setOrigin(origin)
+
+        if settings.gitPrivateKey == nil, let keyURL = getSSHKeyUrl(),
+           let key = try? Data(contentsOf: keyURL), !key.isEmpty {
+            settings.gitPrivateKey = key
+        }
+
+        saveSettings()
+        return true
+    }
+
+    /// `url` of `[remote "origin"]` in a git config file
+    static func originURL(inGitConfig text: String) -> String? {
+        var inOrigin = false
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                inOrigin = line == "[remote \"origin\"]"
+                continue
+            }
+            if inOrigin, line.hasPrefix("url"), let eq = line.firstIndex(of: "=") {
+                let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+}
+#endif

@@ -161,11 +161,21 @@ class ViewController: EditorViewController,
 
         isPreLoaded = true
 
-        if #available(macOS 26.0, *) {
-            newNoteButton.bezelStyle = .glass
-            newNoteButton.borderShape = .circle
-            newNoteButton.controlSize = .large
-            newNoteButton.isBordered = true
+        #if compiler(>=6.2)
+        let useGlassButton: Bool
+        if #available(macOS 26.0, *) { useGlassButton = true } else { useGlassButton = false }
+        #else
+        let useGlassButton = false
+        #endif
+        if useGlassButton {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                newNoteButton.bezelStyle = .glass
+                newNoteButton.borderShape = .circle
+                newNoteButton.controlSize = .large
+                newNoteButton.isBordered = true
+            }
+            #endif
         } else {
             newNoteButton.bezelStyle = .texturedRounded
             newNoteButton.controlSize = .regular
@@ -392,8 +402,8 @@ class ViewController: EditorViewController,
     // MARK: - Initial configuration
     
     private func configureLayout() {
-        searchTopConstraint.constant = search.headerVerticalPadding
-        searchBottomConstraint.constant = search.headerVerticalPadding
+        searchTopConstraint?.constant = search.headerVerticalPadding
+        searchBottomConstraint?.constant = search.headerVerticalPadding
 
         if #available(macOS 26.0, *) {
             // Keep the taller header layout for Liquid Glass.
@@ -438,7 +448,10 @@ class ViewController: EditorViewController,
 
         // Always show notes list at launch
         
-        if (self.splitView.subviews[0].frame.width < 10) {
+        if UserDefaultsManagement.treeExplorer {
+            moveSearchIntoSidebar()
+            hideNoteListForTree()
+        } else if (self.splitView.subviews[0].frame.width < 10) {
             self.splitView.setPosition(300, ofDividerAt: 0)
         }
 
@@ -483,7 +496,90 @@ class ViewController: EditorViewController,
 
     }
 
+    /// Tree explorer: the notes list column is hidden, so its search field and
+    /// "new note" button move to the top of the explorer column.
+    private func moveSearchIntoSidebar() {
+        guard let column = sidebarSplitView.subviews.first,
+              let searchField = search,
+              let button = newNoteButton,
+              searchField.superview !== column else { return }
+
+        let topInset: CGFloat = 38
+        let barHeight: CGFloat = 34
+
+        let bar = NSView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        column.addSubview(bar)
+
+        searchField.removeFromSuperview()
+        button.removeFromSuperview()
+
+        for constraint in searchField.constraints where constraint.firstAttribute == .height && constraint.secondItem == nil {
+            constraint.isActive = false
+        }
+
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        button.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(searchField)
+        bar.addSubview(button)
+
+        // Non-required horizontal edges so the bar never imposes a minimum explorer width
+        let barLeading = bar.leadingAnchor.constraint(equalTo: column.leadingAnchor)
+        let barTrailing = bar.trailingAnchor.constraint(equalTo: column.trailingAnchor)
+        barLeading.priority = .defaultHigh
+        barTrailing.priority = .defaultHigh
+
+        NSLayoutConstraint.activate([
+            bar.topAnchor.constraint(equalTo: column.topAnchor, constant: topInset),
+            barLeading,
+            barTrailing,
+            bar.heightAnchor.constraint(equalToConstant: barHeight),
+
+            searchField.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 8),
+            searchField.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 26),
+            searchField.trailingAnchor.constraint(equalTo: button.leadingAnchor, constant: -4),
+
+            button.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -8),
+            button.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+        ])
+
+        sidebarScrollView.automaticallyAdjustsContentInsets = false
+        sidebarScrollView.contentView.contentInsets.top = topInset + barHeight
+        sidebarScrollView.scrollerInsets.top = topInset + barHeight
+    }
+
+    /// Tree explorer replaces the notes list column: keep it collapsed.
+    public func hideNoteListForTree() {
+        // A hidden subview is treated as collapsed by NSSplitView, so window
+        // resizes never give it width back (a 0-position divider alone does).
+        splitView.shouldHideDivider = true
+        splitView.subviews.first?.isHidden = true
+        splitView.adjustSubviews()
+
+        // Explorer keeps its width on window resize, the editor absorbs the change
+        sidebarSplitView.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        sidebarSplitView.setHoldingPriority(NSLayoutConstraint.Priority(240), forSubviewAt: 1)
+
+        // Repair an explorer squeezed by earlier proportional resizes
+        let width = sidebarSplitView.subviews[0].frame.width
+        if width > 0 && width < 150 {
+            sidebarSplitView.setPosition(max(UserDefaultsManagement.sidebarTableWidth, 200), ofDividerAt: 0)
+        }
+
+        DispatchQueue.main.async {
+            self.splitView.adjustSubviews()
+            self.editor.updateTextContainerInset()
+        }
+    }
+
     public func restoreSidebar() {
+        if UserDefaultsManagement.treeExplorer {
+            self.storage.restoreProjectsExpandState()
+            self.sidebarOutlineView.reloadTree(rebuildRoot: true)
+            return
+        }
+
         self.sidebarOutlineView.sidebarItems = Sidebar().getList()
         self.sidebarOutlineView.reloadData()
 
@@ -497,6 +593,11 @@ class ViewController: EditorViewController,
     }
 
     public func configureSidebar() {
+        if UserDefaultsManagement.treeExplorer {
+            self.restoreSidebar()
+            return
+        }
+
         if isVisibleSidebar() {
             self.restoreSidebar()
             
@@ -534,6 +635,13 @@ class ViewController: EditorViewController,
                     Storage.shared().welcomeNote = nil
                 }
                 
+                // Tree explorer: reopen the last note
+                // (notes of sub folders load later: the tree retries when they arrive)
+                if UserDefaultsManagement.treeExplorer, self.notesTableView.selectedRow < 0 {
+                    self.sidebarOutlineView.pendingRestoreURL = UserDefaultsManagement.lastSelectedURL
+                    self.sidebarOutlineView.restorePendingNote()
+                }
+
                 self.restoreOpenedWindows()
                 self.importAndCreate()
                 
@@ -588,6 +696,7 @@ class ViewController: EditorViewController,
             return
         }
 
+        #if compiler(>=6.2)
         for button in [lockUnlock, previewButton, shareButton].compactMap({ $0 }) {
             button.bezelStyle = .circular
             button.borderShape = .circle
@@ -647,6 +756,7 @@ class ViewController: EditorViewController,
             stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: content.centerYAnchor)
         ])
+        #endif
     }
 
     private func configureShortcuts() {
@@ -832,6 +942,21 @@ class ViewController: EditorViewController,
 
             note.invalidateCache()
         }
+
+        // Tree explorer: the note stays listed (only its folder changed), keep it open
+        // and redraw the tree so it shows up under its new folder
+        if UserDefaultsManagement.treeExplorer {
+            sidebarOutlineView.scheduleTreeReload()
+            if let note = notes.first, notes.count == 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.sidebarOutlineView.revealInTree(note: note, select: true)
+                    if self.editor.note === note {
+                        self.updateTitle(note: note)
+                    }
+                }
+            }
+            return
+        }
         
         editor.clear()
     }
@@ -878,6 +1003,18 @@ class ViewController: EditorViewController,
         // Return / Cmd + Return navigation
         if event.keyCode == kVK_Return {
             if let fr = NSApp.mainWindow?.firstResponder, self.alert == nil {
+                if UserDefaultsManagement.treeExplorer {
+                    // Cmd+Return in the editor jumps to the tree; plain Return is handled by the tree itself
+                    if event.modifierFlags.contains(.command),
+                       fr.isKind(of: EditTextView.self) || fr.isKind(of: MPreviewView.self) {
+                        if !isVisibleSidebar() { toggleSidebar(self) }
+                        NSApp.mainWindow?.makeFirstResponder(self.sidebarOutlineView)
+                        self.sidebarOutlineView.syncTreeSelection()
+                        return false
+                    }
+                    return true
+                }
+
                 if event.modifierFlags.contains(.command) {
                     if fr.isKind(of: NotesTableView.self) {
                         NSApp.mainWindow?.makeFirstResponder(self.sidebarOutlineView)
@@ -936,6 +1073,22 @@ class ViewController: EditorViewController,
             return true
         }
                 
+        // Vim mode: ESC in the editor belongs to vim (IME composition is left to the system)
+        if UserDefaultsManagement.vimMode,
+           event.keyCode == kVK_Escape,
+           NSApp.keyWindow?.firstResponder is EditTextView {
+            return true
+        }
+
+        // Tree explorer: ESC toggles the explorer instead of leaving the note
+        if UserDefaultsManagement.treeExplorer,
+           event.keyCode == kVK_Escape,
+           event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+           NSApplication.shared.mainWindow == NSApplication.shared.keyWindow,
+           !editor.hasMarkedText() {
+            return handleTreeEscape()
+        }
+
         // Focus search bar on ESC
         if (
             (
@@ -1082,6 +1235,12 @@ class ViewController: EditorViewController,
         if event.keyCode == kVK_LeftArrow {
             if let fr = mw.firstResponder {
                 if fr.isKind(of: MPreviewView.self) {
+                    if UserDefaultsManagement.treeExplorer {
+                        if !isVisibleSidebar() { toggleSidebar(self) }
+                        sidebarOutlineView.window?.makeFirstResponder(sidebarOutlineView)
+                        sidebarOutlineView.syncTreeSelection()
+                        return false
+                    }
                     sidebarOutlineView.window?.makeFirstResponder(notesTableView)
                     return false
                 }
@@ -1099,6 +1258,80 @@ class ViewController: EditorViewController,
         }
         
         return true
+    }
+
+    /// Tree explorer: focus is on note rows of the tree → menus act on notes, not folders
+    var isTreeNoteFocused: Bool {
+        guard UserDefaultsManagement.treeExplorer,
+              view.window?.firstResponder === sidebarOutlineView else { return false }
+        return sidebarOutlineView.selectedRowIndexes.contains { sidebarOutlineView.item(atRow: $0) is Note }
+    }
+
+    /// Note open when the current search started (tree explorer)
+    var noteBeforeSearch: URL?
+
+    /// ESC in tree explorer mode: close transient UI first, otherwise show/hide the explorer.
+    private func handleTreeEscape() -> Bool {
+        search.searchesMenu = nil
+        let fr = view.window?.firstResponder
+
+        if let mView = editor.markdownView, mView.isFindPanelVisible {
+            mView.hideFindPanel()
+            NSApp.mainWindow?.makeFirstResponder(mView.webView)
+            return false
+        }
+
+        if editAreaScroll.isFindBarVisible {
+            cancelTextSearch()
+            NSApp.mainWindow?.makeFirstResponder(editor)
+            return false
+        }
+
+        if titleLabel.isEditable {
+            titleLabel.editModeOff()
+            titleLabel.window?.makeFirstResponder(editor)
+            return false
+        }
+
+        // Search with text: clear it and reopen the note that was open before searching
+        if !search.stringValue.isEmpty {
+            search.stringValue = ""
+            search.lastSearchQuery = ""
+            sidebarOutlineView.pendingRestoreURL = noteBeforeSearch ?? UserDefaultsManagement.lastSelectedURL
+            noteBeforeSearch = nil
+            notesTableView.deselectAll(nil)
+            buildSearchQuery()
+            updateTable() {
+                DispatchQueue.main.async {
+                    self.sidebarOutlineView.restorePendingNote()
+                }
+            }
+            return false
+        }
+
+        // Other field editors (e.g. renaming a folder): let them cancel
+        if let fieldEditor = fr as? NSTextView, fieldEditor.isFieldEditor,
+           (fieldEditor.delegate as? NSSearchField) !== search {
+            return true
+        }
+
+        // ESC only closes the explorer; Cmd+Shift+B toggles it
+        let wasVisible = isVisibleSidebar()
+        guard wasVisible else { return true }
+        toggleSidebar(self)
+
+        if wasVisible {
+            // Focus was inside the explorer: move it to the note
+            if fr === sidebarOutlineView || fr === notesTableView || (fr as? NSTextView)?.isFieldEditor == true {
+                if vcEditor?.isPreviewEnabled() == true, let webView = editor.markdownView?.webView {
+                    NSApp.mainWindow?.makeFirstResponder(webView)
+                } else {
+                    focusEditArea()
+                }
+            }
+        }
+
+        return false
     }
 
     @objc func onWakeNote(note: NSNotification) {
@@ -1297,6 +1530,18 @@ class ViewController: EditorViewController,
     @IBAction func toggleNoteList(_ sender: Any) {
         guard let vc = ViewController.shared() else { return }
 
+        // Tree explorer: the notes list is gone, Cmd+Shift+B toggles the explorer
+        if UserDefaultsManagement.treeExplorer {
+            let fr = vc.view.window?.firstResponder
+            let wasVisible = vc.isVisibleSidebar()
+            vc.toggleSidebar(sender)
+
+            if wasVisible, fr === vc.sidebarOutlineView || (fr as? NSTextView)?.isFieldEditor == true {
+                vc.focusEditArea()
+            }
+            return
+        }
+
         let size = UserDefaultsManagement.horizontalOrientation
             ? vc.splitView.subviews[0].frame.height
             : vc.splitView.subviews[0].frame.width
@@ -1329,11 +1574,34 @@ class ViewController: EditorViewController,
     @IBAction func toggleSidebar(_ sender: Any) {
         guard let vc = ViewController.shared() else { return }
 
+        if UserDefaultsManagement.treeExplorer, let column = vc.sidebarSplitView.subviews.first {
+            // Hide/unhide the whole column: collapsing via divider position fails
+            // whenever the column has a minimum width.
+            if isVisibleSidebar() {
+                if column.frame.width >= 150 {
+                    UserDefaultsManagement.sidebarTableWidth = column.frame.width
+                }
+                column.isHidden = true
+                vc.sidebarSplitView.adjustSubviews()
+            } else {
+                column.isHidden = false
+                let width = UserDefaultsManagement.sidebarTableWidth
+                vc.sidebarSplitView.adjustSubviews()
+                vc.sidebarSplitView.setPosition(width < 150 ? 200 : width, ofDividerAt: 0)
+                vc.reloadSideBar()
+            }
+
+            vc.checkSidebarConstraint()
+            vc.editor.updateTextContainerInset()
+            return
+        }
+
         if isVisibleSidebar() {
             UserDefaultsManagement.sidebarTableWidth = vc.sidebarSplitView.subviews[0].frame.width
             vc.sidebarSplitView.setPosition(0, ofDividerAt: 0)
         } else {
-            vc.sidebarSplitView.setPosition(UserDefaultsManagement.sidebarTableWidth, ofDividerAt: 0)
+            let width = UserDefaultsManagement.sidebarTableWidth
+            vc.sidebarSplitView.setPosition(UserDefaultsManagement.treeExplorer && width < 150 ? 200 : width, ofDividerAt: 0)
 
             vc.reloadSideBar()
         }
@@ -1539,7 +1807,7 @@ class ViewController: EditorViewController,
             if operation.isCancelled { return }
             
             DispatchQueue.main.async {
-                self?.counter.stringValue = title
+                self?.counter.stringValue = (self?.editor.vimIndicatorPrefix ?? "") + title
             }
         }
             
@@ -1677,6 +1945,21 @@ class ViewController: EditorViewController,
     public func buildSearchQuery() {
         let searchQuery = SearchQuery()
         let filter = search.stringValue
+
+        // Tree explorer: the (hidden) notes table always holds every visible note,
+        // the tree groups them by folder.
+        if UserDefaultsManagement.treeExplorer {
+            // Remember the open note when a search starts, ESC brings it back
+            if !filter.isEmpty && storage.searchQuery.filter.isEmpty {
+                noteBeforeSearch = editor.note?.url ?? UserDefaultsManagement.lastSelectedURL
+            }
+            searchQuery.allProjects = true
+            // Trash shows up only while not searching
+            searchQuery.includeTrash = filter.isEmpty
+            searchQuery.setFilter(filter)
+            self.storage.setSearchQuery(value: searchQuery)
+            return
+        }
 
         var projects = [Project]()
         var tags = [String]()
@@ -2017,7 +2300,7 @@ class ViewController: EditorViewController,
     func checkSidebarConstraint() {
         let sidebarHidden = sidebarSplitView.subviews[0].frame.width <= 50
         let fullScreen = search.window?.styleMask.contains(.fullScreen) == true
-        searchTopConstraint.constant = search.headerVerticalPadding
+        searchTopConstraint?.constant = search.headerVerticalPadding
             + (sidebarHidden && !fullScreen ? 24 : 0)
     }
             
@@ -2298,6 +2581,10 @@ class ViewController: EditorViewController,
     
     public func isVisibleSidebar() -> Bool {
         guard let vc = ViewController.shared() else { return false }
+
+        if vc.sidebarSplitView.subviews[0].isHidden {
+            return false
+        }
 
         let size = Int(vc.sidebarSplitView.subviews[0].frame.width)
         

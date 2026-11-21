@@ -84,7 +84,7 @@ class NoteCellView: NSTableCellView {
             preview.isHidden = false
         }
 
-        if UserDefaultsManagement.hidePreviewImages || UserDefaultsManagement.horizontalOrientation {
+        if UserDefaultsManagement.hidePreviewImages || UserDefaultsManagement.horizontalOrientation || UserDefaultsManagement.privateMode {
             imagePreview.isHidden = true
             imagePreviewSecond.isHidden = true
             imagePreviewThird.isHidden = true
@@ -92,7 +92,7 @@ class NoteCellView: NSTableCellView {
 
         applyPreviewStyle()
 
-        if !UserDefaultsManagement.horizontalOrientation && !UserDefaultsManagement.hidePreviewImages {
+        if !UserDefaultsManagement.horizontalOrientation && !UserDefaultsManagement.hidePreviewImages && !UserDefaultsManagement.privateMode {
             self.note?.loadPreviewInfo()
         }
     }
@@ -161,7 +161,10 @@ class NoteCellView: NSTableCellView {
     }
     
     func applyPreviewAttributes(_ maximumNumberOfLines: Int = 1) {
-        let string = preview.stringValue
+        var string = preview.stringValue
+        if UserDefaultsManagement.privateMode && !string.isEmpty {
+            string = "..."
+        }
         let fontName = UserDefaultsManagement.noteFont.fontName
 
         let previewFontSize = CGFloat(UserDefaultsManagement.previewFontSize)

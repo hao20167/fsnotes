@@ -17,6 +17,9 @@ class SearchQuery {
     var sortBy: SortBy = .modificationDate
     var sortDirection: SortDirection = .asc
     public var filter = String()
+    /// Tree explorer: every non-trash folder, including folders loaded later
+    var allProjects = false
+    var includeTrash = false   // tree explorer: trashed notes are listed under the Trash folder
 
     init() {}
 
@@ -31,6 +34,8 @@ class SearchQuery {
         query.sortBy = sortBy
         query.sortDirection = sortDirection
         query.filter = filter
+        query.allProjects = allProjects
+        query.includeTrash = includeTrash
         return query
     }
     
@@ -70,9 +75,12 @@ class SearchQuery {
                 || self.type == .Todo && note.project.settings.showInCommon
                 || !UserDefaultsManagement.inlineTags && self.tags.count > 0
                 || self.type != .Inbox && self.projects.contains(note.project)
+                || self.allProjects && !note.project.isTrash && !note.project.isVirtual && note.project.isTopLevel
+                || self.allProjects && self.includeTrash && note.project.isTrash
             ) && (
                 self.type == .Trash && note.isTrash()
                 || self.type != .Trash && !note.isTrash()
+                || self.includeTrash && note.isTrash()
             ) && (
                 self.tags.count == 0
                 || UserDefaultsManagement.inlineTags

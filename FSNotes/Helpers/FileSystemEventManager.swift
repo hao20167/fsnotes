@@ -206,7 +206,8 @@ class FileSystemEventManager {
                     UserDataService.instance.focusOnImport = nil
                 }
             } else {
-                if !note.isTrash() {
+                // Tree explorer lists trashed notes under Trash (the query decides)
+                if !note.isTrash() || UserDefaultsManagement.treeExplorer {
                     OperationQueue.main.addOperation {
                         self.delegate.notesTableView.insertRows(notes: [note])
                     }

@@ -32,6 +32,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     public static var gitProgress: GitProgress?
 
+    override init() {
+        // Fork: take over the settings of the original FSNotes. Must run before anything
+        // touches Storage (the main window loads the notes before willFinishLaunching).
+        ForkMigration.runIfNeeded()
+        super.init()
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         checkStorageChanges()
         loadDockIcon()
@@ -49,12 +56,113 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Private mode
+
+    private static let privateModeMenuIdentifier = NSUserInterfaceItemIdentifier("view.privateMode")
+
+    private func setupPrivateModeMenu() {
+        guard let mainMenu = NSApp.mainMenu else { return }
+
+        func find(_ identifier: String, in menu: NSMenu) -> NSMenuItem? {
+            for item in menu.items {
+                if item.identifier?.rawValue == identifier { return item }
+                if let sub = item.submenu, let found = find(identifier, in: sub) { return found }
+            }
+            return nil
+        }
+
+        // Cmd+Shift+H was "History": move it to Ctrl+Cmd+H
+        if let history = find("fileMenu.history", in: mainMenu) {
+            history.keyEquivalent = "h"
+            history.keyEquivalentModifierMask = [.command, .control]
+        }
+
+        guard find(AppDelegate.privateModeMenuIdentifier.rawValue, in: mainMenu) == nil,
+              let viewMenu = mainMenu.items.first(where: { $0.submenu?.identifier?.rawValue == "viewMenu" })?.submenu
+        else { return }
+
+        let item = NSMenuItem(title: NSLocalizedString("Private Mode", comment: ""), action: #selector(togglePrivateMode(_:)), keyEquivalent: "h")
+        item.keyEquivalentModifierMask = [.command, .shift]
+        item.identifier = AppDelegate.privateModeMenuIdentifier
+        item.target = self
+        item.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: nil)
+        item.state = UserDefaultsManagement.privateMode ? .on : .off
+
+        // Put it right after "Toggle Preview"
+        let index = viewMenu.items.firstIndex(where: { $0.action == NSSelectorFromString("togglePreview:") }).map { $0 + 1 } ?? 0
+        viewMenu.insertItem(item, at: index)
+
+        // Private mode: lines shown around the current one
+        let linesItem = NSMenuItem(title: NSLocalizedString("Private Mode Lines", comment: ""), action: nil, keyEquivalent: "")
+        let linesMenu = NSMenu(title: linesItem.title)
+        for value in [0, 1, 2, 3, 5, 10] {
+            let title = value == 0
+                ? NSLocalizedString("Current line only", comment: "")
+                : String(format: NSLocalizedString("±%d lines", comment: ""), value)
+            let option = NSMenuItem(title: title, action: #selector(setPrivateModeLines(_:)), keyEquivalent: "")
+            option.target = self
+            option.tag = value
+            option.state = UserDefaultsManagement.privateModeContextLines == value ? .on : .off
+            linesMenu.addItem(option)
+        }
+        linesItem.submenu = linesMenu
+        viewMenu.insertItem(linesItem, at: index + 1)
+
+        let vimItem = NSMenuItem(title: NSLocalizedString("Vim Mode", comment: ""), action: #selector(toggleVimMode(_:)), keyEquivalent: "")
+        vimItem.target = self
+        vimItem.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
+        vimItem.state = UserDefaultsManagement.vimMode ? .on : .off
+        viewMenu.insertItem(vimItem, at: index + 2)
+    }
+
+    @objc func setPrivateModeLines(_ sender: NSMenuItem) {
+        UserDefaultsManagement.privateModeContextLines = sender.tag
+        sender.menu?.items.forEach { $0.state = $0.tag == sender.tag ? .on : .off }
+
+        for editor in AppDelegate.getEditTextViews() {
+            editor.needsDisplay = true
+        }
+    }
+
+    @objc func toggleVimMode(_ sender: Any?) {
+        UserDefaultsManagement.vimMode.toggle()
+        (sender as? NSMenuItem)?.state = UserDefaultsManagement.vimMode ? .on : .off
+
+        for editor in AppDelegate.getEditTextViews() {
+            editor.vimModeDidToggle()
+        }
+    }
+
+    @objc func togglePrivateMode(_ sender: Any?) {
+        UserDefaultsManagement.privateMode.toggle()
+
+        if let item = sender as? NSMenuItem {
+            item.state = UserDefaultsManagement.privateMode ? .on : .off
+        } else if let mainMenu = NSApp.mainMenu {
+            for top in mainMenu.items {
+                if let item = top.submenu?.items.first(where: { $0.identifier == AppDelegate.privateModeMenuIdentifier }) {
+                    item.state = UserDefaultsManagement.privateMode ? .on : .off
+                }
+            }
+        }
+
+        for editor in AppDelegate.getEditTextViews() {
+            editor.needsDisplay = true
+        }
+
+        if let vc = ViewController.shared() {
+            vc.notesTableView.reloadData()
+        }
+    }
+
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         // Ensure the font panel is closed when the app starts, in case it was
         // left open when the app quit.
         NSFontManager.shared.fontPanel(false)?.orderOut(self)
 
         applyAppearance()
+        setupPrivateModeMenu()
+        ForkMigration.finishAfterLaunch()
 
         #if CLOUD_RELATED_BLOCK
         if let iCloudDocumentsURL = FileManager.default.url(forUbiquityContainerIdentifier: nil)?.appendingPathComponent("Documents").standardized {
@@ -495,5 +603,169 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         
         return views
+    }
+}
+
+
+// MARK: - Fork migration
+
+/// One-time import of the original FSNotes settings, so this build can simply replace
+/// FSNotes.app in /Applications. The original app is sandboxed (its data lives in its
+/// container); this build is not, so it reads the container once and never writes there.
+enum ForkMigration {
+    private static let doneKey = "forkMigrationDone"
+    private static let gitPendingKey = "forkGitImportPending"
+    private static let summaryKey = "forkMigrationSummary"
+    /// Testing only: a folder laid out like the original container's `Data` directory
+    private static let sourceOverrideKey = "forkMigrationSource"
+
+    // Keys handled separately or not worth carrying over
+    private static let skippedKeys: Set<String> = ["storageType", "storageUrl", "crashedLastTime"]
+
+    private static var defaults: UserDefaults { UserDefaults.standard }
+
+    private static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
+
+    private static var sourceData: URL {
+        if let override = defaults.string(forKey: sourceOverrideKey), !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return home.appendingPathComponent("Library/Containers/co.fluder.FSNotes/Data", isDirectory: true)
+    }
+
+    static func runIfNeeded() {
+        guard !defaults.bool(forKey: doneKey) else { return }
+        print("Fork migration: importing settings of the original FSNotes")
+
+        let fm = FileManager.default
+        let source = sourceData
+        let plist = source.appendingPathComponent("Library/Preferences/co.fluder.FSNotes.plist")
+
+        // Nothing to import (fresh install): never ask again
+        guard fm.fileExists(atPath: source.path) else {
+            defaults.set(true, forKey: doneKey)
+            return
+        }
+
+        // Reading another app's container may show a macOS permission prompt;
+        // if access is refused, try again next launch.
+        guard let original = NSDictionary(contentsOf: plist) as? [String: Any] else { return }
+
+        var summary = [String]()
+
+        // 1. Preferences (fonts, theme, window sizes, git interval…)
+        var copied = 0
+        for (key, value) in original where !skippedKeys.contains(key) {
+            defaults.set(value, forKey: key)
+            copied += 1
+        }
+        summary.append("\(copied) settings")
+
+        // 2. Notes folder (real path: folders found on disk are matched against it)
+        if let found = storagePath(from: original, source: source) {
+            let path = realPath(found)
+            defaults.set(StorageType.custom.rawValue, forKey: "storageType")
+            defaults.set(path, forKey: "storageUrl")
+            summary.append("notes folder: \(path)")
+        }
+
+        // 3. Git repositories, SSH keys and per-folder settings files (never overwrite)
+        let sourceSupport = source.appendingPathComponent("Library/Application Support", isDirectory: true)
+        if let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let repos = copyMissing(from: sourceSupport.appendingPathComponent("Repositories"),
+                                    to: support.appendingPathComponent("Repositories"))
+            let keys = copyMissing(from: sourceSupport.appendingPathComponent("Keys"),
+                                   to: support.appendingPathComponent("Keys"))
+            if let items = try? fm.contentsOfDirectory(atPath: sourceSupport.path) {
+                for name in items where name.hasPrefix("es.fsnot.project-settings") {
+                    let dst = support.appendingPathComponent(name)
+                    if !fm.fileExists(atPath: dst.path) {
+                        try? fm.copyItem(at: sourceSupport.appendingPathComponent(name), to: dst)
+                    }
+                }
+            }
+            if repos > 0 { summary.append("\(repos) git repositories") }
+            if keys > 0 { summary.append("\(keys) SSH keys") }
+        }
+
+        defaults.set(true, forKey: gitPendingKey)
+        defaults.set(summary, forKey: summaryKey)
+        defaults.set(true, forKey: doneKey)
+    }
+
+    /// Notes folder used by the original app, as a plain path this build can open
+    private static func storagePath(from original: [String: Any], source: URL) -> String? {
+        let fm = FileManager.default
+        let type = (original["storageType"] as? Int) ?? StorageType.none.rawValue
+
+        switch StorageType(rawValue: type) {
+        case .iCloudDrive?:
+            let cloud = home.appendingPathComponent("Library/Mobile Documents/iCloud~co~fluder~fsnotes/Documents", isDirectory: true)
+            return fm.fileExists(atPath: cloud.path) ? cloud.path : nil
+        case .custom?:
+            if let path = original["storageUrl"] as? String, fm.fileExists(atPath: path) { return path }
+            return nil
+        case .local?:
+            let documents = source.appendingPathComponent("Documents", isDirectory: true)
+            return fm.fileExists(atPath: documents.path) ? documents.path : nil
+        default:
+            return nil
+        }
+    }
+
+    /// Fully resolved path (`realpath`: unlike Foundation it keeps /private/tmp, /private/var)
+    private static func realPath(_ path: String) -> String {
+        guard let resolved = realpath(path, nil) else { return path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    @discardableResult
+    private static func copyMissing(from src: URL, to dst: URL) -> Int {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: src.path) else { return 0 }
+        try? fm.createDirectory(at: dst, withIntermediateDirectories: true)
+
+        var count = 0
+        for name in items where name != "tmp" && !name.hasPrefix(".") {
+            let target = dst.appendingPathComponent(name)
+            guard !fm.fileExists(atPath: target.path) else { continue }
+            if (try? fm.copyItem(at: src.appendingPathComponent(name), to: target)) != nil {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// After the notes are loaded: rebuild per-folder git settings (the original keeps them
+    /// in iCloud key-value storage, which only its own signed build can read), then report.
+    static func finishAfterLaunch() {
+        guard defaults.bool(forKey: gitPendingKey) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            defaults.set(false, forKey: gitPendingKey)
+
+            var gitFolders = [String]()
+            for project in Storage.shared().getProjects() where project.importLegacyGitSettings() {
+                gitFolders.append(project.label)
+            }
+
+            var lines = (defaults.stringArray(forKey: summaryKey) ?? [])
+            defaults.removeObject(forKey: summaryKey)
+            if !gitFolders.isEmpty {
+                lines.append("git backup for: " + gitFolders.joined(separator: ", "))
+            }
+            guard !lines.isEmpty else { return }
+
+            let alert = NSAlert()
+            alert.messageText = NSLocalizedString("Settings imported from FSNotes", comment: "")
+            var text = lines.map { "• " + $0 }.joined(separator: "\n")
+            if !gitFolders.isEmpty {
+                text += "\n\n" + NSLocalizedString("If your SSH key has a passphrase, enter it again in Settings → Git (the original app keeps it in iCloud, out of reach for this build).", comment: "")
+            }
+            alert.informativeText = text
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 }
