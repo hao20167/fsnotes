@@ -598,6 +598,21 @@ enum MathPreview {
         #endif
     }
 
+    /// Top of the caret's line fragment in view coordinates (lays out up to the caret)
+    static func caretY(in view: NSTextView) -> CGFloat? {
+        guard let lm = view.layoutManager, let storage = view.textStorage, let container = view.textContainer else { return nil }
+        let location = view.selectedRange().location
+        let origin = view.textContainerOrigin.y
+
+        if location >= storage.length {
+            lm.ensureLayout(for: container)
+            if !lm.extraLineFragmentRect.isEmpty { return lm.extraLineFragmentRect.minY + origin }
+            guard storage.length > 0 else { return origin }
+        }
+        let glyph = lm.glyphIndexForCharacter(at: min(location, storage.length - 1))
+        return lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY + origin
+    }
+
     /// Applies/removes the render attribute: every formula except the ones on the active line.
     /// Returns true when something changed.
     @discardableResult
@@ -630,7 +645,9 @@ enum MathPreview {
             for preview in previews {
                 if let active = active {
                     let paragraphs = string.paragraphRange(for: preview.range)
-                    if NSIntersectionRange(active, paragraphs).length > 0 || active.location == NSMaxRange(paragraphs) && active.length == 0 && active.location == string.length {
+                    // Only the line holding the caret shows raw LaTeX (an empty last line
+                    // after the formula is a different line)
+                    if NSIntersectionRange(active, paragraphs).length > 0 {
                         continue
                     }
                 }
@@ -666,11 +683,39 @@ enum MathPreview {
         let touched = (current.map { $0.0 } + desired.map { $0.0 })
         let invalidate = {
             for layoutManager in textStorage.layoutManagers {
+                let views = layoutManager.textContainers.compactMap { $0.textView }
+
+                // A formula switching between raw LaTeX (often several wrapped lines) and its
+                // image changes height. Keep the caret line where it is on screen, otherwise
+                // the view jumps or shows an empty, not yet laid out area (non-contiguous layout).
+                var anchors = [(NSTextView, CGFloat)]()
+                for view in views {
+                    if let y = MathPreview.caretY(in: view), y >= view.visibleRect.minY, y <= view.visibleRect.maxY {
+                        anchors.append((view, y - view.visibleRect.minY))
+                    }
+                }
+
                 for range in touched where NSMaxRange(range) <= textStorage.length {
                     layoutManager.invalidateGlyphs(forCharacterRange: range, changeInLength: 0, actualCharacterRange: nil)
                     layoutManager.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
                 }
-                layoutManager.textContainers.forEach { $0.textView?.needsDisplay = true }
+
+                for (view, offset) in anchors {
+                    guard let y = MathPreview.caretY(in: view), let clip = view.enclosingScrollView?.contentView else { continue }
+                    let maxY = max(0, view.frame.height - clip.bounds.height)
+                    let origin = NSPoint(x: clip.bounds.origin.x, y: min(max(0, y - offset), maxY))
+                    if abs(origin.y - clip.bounds.origin.y) > 0.5 {
+                        clip.scroll(to: origin)
+                        view.enclosingScrollView?.reflectScrolledClipView(clip)
+                    }
+                }
+
+                for view in views {
+                    if let container = view.textContainer {
+                        layoutManager.ensureLayout(forBoundingRect: view.visibleRect, in: container)
+                    }
+                    view.needsDisplay = true
+                }
             }
         }
         if textStorage.editedMask.isEmpty {

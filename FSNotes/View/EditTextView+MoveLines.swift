@@ -179,6 +179,11 @@ final class VimEngine {
     private var register = NSAttributedString()
     private var registerLinewise = false
     private var lastFind: (char: String, kind: Character)?
+    private var lastSearch: (pattern: String, forward: Bool)?
+
+    /// System clipboard (replaceable in tests). `p` takes text copied in other apps.
+    var pasteboard: NSPasteboard = .general
+    private var yankChangeCount = -1
     private var desiredColumn: Int?
     private var visualAnchor = 0
     private var cursor = 0
@@ -191,6 +196,7 @@ final class VimEngine {
 
     // One undo step per command, including the insert session it opens (`o…<Esc>`, `cw…<Esc>`)
     private var commandUndoOpen = false
+    private var reopenInsertGroup = false
     // The manager the group was opened on: switching notes swaps the view's manager
     private weak var commandUndoManager: UndoManager?
 
@@ -214,9 +220,19 @@ final class VimEngine {
         um.groupsByEvent = true
     }
 
+    /// Edit ▸ Undo/Redo (shortcut or menu) during insert: NSUndoManager refuses to undo while
+    /// our insert group is open ("too many nested undo groups"). Close it first: what was
+    /// typed so far becomes one step, the next typed key opens a new one.
+    func prepareForMenuUndo() {
+        guard mode == .insert, commandUndoOpen else { return }
+        endCommandUndo()
+        reopenInsertGroup = true
+    }
+
     /// The editor switched to another note: nothing pending may leak into it.
     func noteDidChange() {
         endCommandUndo()
+        reopenInsertGroup = false
         reset()
         recordingChange = false
         insertStart = nil
@@ -228,8 +244,22 @@ final class VimEngine {
         pendingOperator != nil || !pendingPrefix.isEmpty || !count.isEmpty || !opCount.isEmpty
     }
 
+    private var menuObserver: NSObjectProtocol?
+
     init(view: EditTextView) {
         self.view = view
+        // Edit ▸ Undo picked with the mouse never reaches keyDown: close the insert group as
+        // soon as a menu opens over the focused editor.
+        menuObserver = NotificationCenter.default.addObserver(
+            forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, let view = self.view, view.window?.firstResponder === view else { return }
+            self.prepareForMenuUndo()
+        }
+    }
+
+    deinit {
+        if let menuObserver = menuObserver { NotificationCenter.default.removeObserver(menuObserver) }
     }
 
     // MARK: Entry
@@ -244,7 +274,10 @@ final class VimEngine {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
         // Never steal menu shortcuts
-        if flags.contains(.command) { return false }
+        if flags.contains(.command) {
+            if event.charactersIgnoringModifiers?.lowercased() == "z" { prepareForMenuUndo() }
+            return false
+        }
 
         if mode == .insert {
             if event.keyCode == UInt16(kVK_Escape) || (flags.contains(.control) && event.charactersIgnoringModifiers == "[") {
@@ -254,6 +287,10 @@ final class VimEngine {
             // Cmd+Z during insert closes our group: reopen so typing stays registrable
             if commandUndoOpen, let um = commandUndoManager, um === view.undoManager, um.groupingLevel == 0 {
                 um.beginUndoGrouping()
+            }
+            if reopenInsertGroup, !commandUndoOpen {
+                reopenInsertGroup = false
+                beginCommandUndo()
             }
             return false
         }
@@ -414,7 +451,10 @@ final class VimEngine {
         guard let view = view else { return }
         let sel = view.selectedRange()
         if mode == .visual || mode == .visualLine { return }
-        cursor = min(sel.location, length)
+        let location = min(sel.location, length)
+        // Moved by mouse/arrow keys/editing: forget the column remembered by j/k
+        if location != cursor { desiredColumn = nil }
+        cursor = location
     }
 
     // MARK: Editing primitives (undoable)
@@ -448,9 +488,26 @@ final class VimEngine {
         registerLinewise = linewise
 
         // Mirror plain text to the system pasteboard (images stay in the vim register)
-        let pb = NSPasteboard.general
+        let pb = pasteboard
         pb.clearContents()
         pb.setString(sub.string.replacingOccurrences(of: "\u{FFFC}", with: ""), forType: .string)
+        yankChangeCount = pb.changeCount
+    }
+
+    /// Text copied elsewhere (Cmd+C here or in another app) replaces the vim register,
+    /// like vim's `clipboard=unnamedplus`.
+    private func syncRegisterFromPasteboard() {
+        let pb = pasteboard
+        guard pb.changeCount != yankChangeCount else { return }
+        yankChangeCount = pb.changeCount
+        guard var string = pb.string(forType: .string), !string.isEmpty else { return }
+        string = string.replacingOccurrences(of: "\r\n", with: "\n")
+
+        // Our own yank (attachments stripped on the clipboard): keep the richer register
+        if string == register.string.replacingOccurrences(of: "\u{FFFC}", with: "") { return }
+
+        register = NSAttributedString(string: string, attributes: view?.typingAttributes ?? [:])
+        registerLinewise = string.hasSuffix("\n")
     }
 
     private func group(_ block: () -> Void) {
@@ -487,6 +544,7 @@ final class VimEngine {
         recordingChange = false
         if !replaying { keyLog = [] }
         insertStart = nil
+        reopenInsertGroup = false
         view.breakUndoCoalescing()
         endCommandUndo()
 
@@ -622,6 +680,14 @@ final class VimEngine {
             return
         default:
             break
+        }
+
+        if c == "/" || c == "?" {
+            let forward = c == "/"
+            view?.vimPromptSearch(forward: forward) { [weak self] pattern in
+                self?.searchEntered(pattern, forward: forward)
+            }
+            return
         }
 
         if let motion = motion(for: c) {
@@ -771,6 +837,26 @@ final class VimEngine {
             }
             guard let t = find(last.char, kind: kind, from: cursor, count: n, repeating: true) else { return Motion(target: cursor, kind: .exclusive) }
             return Motion(target: t, kind: kind == "f" || kind == "t" ? .inclusive : .exclusive)
+        case "n", "N":
+            guard let last = lastSearch else { return Motion(target: cursor, kind: .exclusive) }
+            let forward = c == "n" ? last.forward : !last.forward
+            guard let match = searchMatch(last.pattern, forward: forward, from: cursor, count: n) else {
+                return Motion(target: cursor, kind: .exclusive)
+            }
+            view?.vimFlash(range: match)
+            return Motion(target: match.location, kind: .exclusive)
+        case "*", "#":
+            let word = textObject("w", inner: true).map { text.substring(with: $0) } ?? ""
+            guard !word.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return Motion(target: cursor, kind: .exclusive) }
+            let escaped = NSRegularExpression.escapedPattern(for: word)
+            let isWord = word.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || $0 == "_" }
+            lastSearch = (isWord ? "\\b\(escaped)\\b" : escaped, c == "*")
+            let wordStart = textObject("w", inner: true)?.location ?? cursor
+            guard let match = searchMatch(lastSearch!.pattern, forward: c == "*", from: c == "*" ? cursor : wordStart, count: n, exact: true) else {
+                return Motion(target: cursor, kind: .exclusive)
+            }
+            view?.vimFlash(range: match)
+            return Motion(target: match.location, kind: .exclusive)
         case "}":
             var t = cursor
             for _ in 0..<n { t = paragraphForward(t) }
@@ -906,6 +992,62 @@ final class VimEngine {
         return pos
     }
 
+    // MARK: Search
+
+    /// Pattern typed after `/` or `?` (nil = cancelled). Works as a motion, so `d/foo` too.
+    func searchEntered(_ pattern: String?, forward: Bool) {
+        defer {
+            if mode != .insert && !hasPendingCommand { endCommandUndo() }
+        }
+        guard let pattern = pattern else { reset(); return }
+
+        let effective = pattern.isEmpty ? lastSearch?.pattern : pattern
+        guard let search = effective, !search.isEmpty else { reset(); return }
+        lastSearch = (search, forward)
+
+        guard let match = searchMatch(search, forward: forward, from: cursor, count: effectiveCount) else {
+            reset()
+            return
+        }
+        view?.vimFlash(range: match)
+        let hadOperator = pendingOperator != nil
+        runMotion(Motion(target: match.location, kind: .exclusive))
+
+        // "." cannot replay a typed search: do not record `d/foo` as repeatable
+        if hadOperator, let last = lastChange.last?.chars, last == "/" || last == "?" {
+            lastChange = []
+        }
+    }
+
+    /// Next match of `pattern` after (or before) `from`, wrapping around the note.
+    /// Regex when valid, literal text otherwise; ignores case unless the pattern has capitals.
+    func searchMatch(_ pattern: String, forward: Bool, from: Int, count: Int = 1, exact: Bool = false) -> NSRange? {
+        let t = text
+        var options: NSRegularExpression.Options = []
+        if !exact && pattern == pattern.lowercased() { options.insert(.caseInsensitive) }
+
+        let regex = (try? NSRegularExpression(pattern: pattern, options: options))
+            ?? (try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: pattern), options: options))
+        guard let regex = regex else { return nil }
+
+        let matches = regex.matches(in: t as String, options: [], range: NSRange(location: 0, length: t.length))
+            .map { $0.range }
+            .filter { $0.length > 0 }
+        guard !matches.isEmpty else { return nil }
+
+        var position = from
+        var result: NSRange?
+        for _ in 0..<max(1, count) {
+            if forward {
+                result = matches.first(where: { $0.location > position }) ?? matches.first
+            } else {
+                result = matches.last(where: { $0.location < position }) ?? matches.last
+            }
+            position = result?.location ?? position
+        }
+        return result
+    }
+
     // MARK: Text objects
 
     private func textObject(_ c: String, inner: Bool) -> NSRange? {
@@ -987,6 +1129,7 @@ final class VimEngine {
         switch op {
         case "y":
             yank(range, linewise: linewise)
+            view?.vimFlash(range: range)
             mode = .normal
             setCursor(linewise ? min(cursor, max(range.location, cursor)) : range.location)
             finishCommand(isChange: false)
@@ -1045,6 +1188,7 @@ final class VimEngine {
     }
 
     private func applyVisualPut() {
+        syncRegisterFromPasteboard()
         let sel = view?.selectedRange() ?? NSRange(location: cursor, length: 0)
         let content = register
         group {
@@ -1164,6 +1308,7 @@ final class VimEngine {
     }
 
     private func put(after: Bool, count n: Int) {
+        syncRegisterFromPasteboard()
         guard register.length > 0 else { reset(); return }
         let content = NSMutableAttributedString()
         for _ in 0..<n { content.append(register) }
@@ -1353,6 +1498,25 @@ extension EditTextView {
         block.fill(using: .sourceOver)
     }
 
+    /// Brief highlight (yank, search match), like vim's highlight-on-yank
+    func vimFlash(range: NSRange) {
+        guard let lm = layoutManager, let storage = textStorage else { return }
+        let safe = NSIntersectionRange(range, NSRange(location: 0, length: storage.length))
+        guard safe.length > 0 else { return }
+        let color = NSColor.findHighlightColor.withAlphaComponent(0.55)
+        lm.addTemporaryAttribute(.backgroundColor, value: color, forCharacterRange: safe)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak lm] in
+            guard let lm = lm, let length = lm.textStorage?.length else { return }
+            lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: NSIntersectionRange(safe, NSRange(location: 0, length: length)))
+        }
+    }
+
+    /// Vim-style command line at the bottom of the editor for `/` and `?`
+    func vimPromptSearch(forward: Bool, completion: @escaping (String?) -> Void) {
+        guard let host = enclosingScrollView?.superview ?? enclosingScrollView else { completion(nil); return }
+        VimSearchBar.shared.show(in: host, prefix: forward ? "/" : "?", editor: self, completion: completion)
+    }
+
     func vimCaretWidth() -> CGFloat {
         guard let storage = textStorage, let lm = layoutManager, let container = textContainer else { return 8 }
         let loc = selectedRange().location
@@ -1362,5 +1526,114 @@ extension EditTextView {
             if rect.width > 1 { return min(rect.width, UserDefaultsManagement.noteFont.pointSize * 1.2) }
         }
         return max(6, UserDefaultsManagement.noteFont.pointSize * 0.55)
+    }
+}
+
+
+/// One-line input shown at the bottom of the editor while typing a vim search
+final class VimSearchBar: NSObject, NSTextFieldDelegate {
+    static let shared = VimSearchBar()
+
+    private let bar = NSView()
+    private let label = NSTextField(labelWithString: "/")
+    private let field = NSTextField()
+    private var completion: ((String?) -> Void)?
+    private weak var editor: NSTextView?
+    private var history = [String]()
+    private var historyIndex = 0
+
+    private override init() {
+        super.init()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.delegate = self
+        let font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        label.font = font
+        field.font = font
+        bar.addSubview(label)
+        bar.addSubview(field)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 10),
+            label.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            field.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 2),
+            field.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -10),
+            field.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+        ])
+    }
+
+    func show(in host: NSView, prefix: String, editor: NSTextView, completion: @escaping (String?) -> Void) {
+        finish(with: nil)
+        self.completion = completion
+        self.editor = editor
+        label.stringValue = prefix
+        field.stringValue = ""
+        historyIndex = history.count
+        bar.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+        host.addSubview(bar, positioned: .above, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 24),
+        ])
+        host.window?.makeFirstResponder(field)
+    }
+
+    /// Closes the bar without searching and without moving focus (preview toggled, note switched)
+    func dismiss() {
+        guard let done = completion else { return }
+        completion = nil
+        bar.removeFromSuperview()
+        done(nil)
+    }
+
+    private func finish(with value: String?) {
+        guard let done = completion else { return }
+        completion = nil
+        bar.removeFromSuperview()
+        if let editor = editor { editor.window?.makeFirstResponder(editor) }
+        if let value = value, !value.isEmpty, history.last != value { history.append(value) }
+        done(value)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            finish(with: field.stringValue)
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            finish(with: nil)
+            return true
+        case #selector(NSResponder.deleteBackward(_:)) where field.stringValue.isEmpty:
+            finish(with: nil)
+            return true
+        case #selector(NSResponder.moveUp(_:)) where !history.isEmpty:
+            historyIndex = max(0, historyIndex - 1)
+            field.stringValue = history[historyIndex]
+            return true
+        case #selector(NSResponder.moveDown(_:)) where !history.isEmpty:
+            historyIndex = min(history.count, historyIndex + 1)
+            field.stringValue = historyIndex < history.count ? history[historyIndex] : ""
+            return true
+        default:
+            return false
+        }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        // Focus moved elsewhere (click in the editor or the explorer): cancel
+        if completion != nil, bar.window?.firstResponder !== field.currentEditor() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.completion != nil,
+                      self.bar.window?.firstResponder !== self.field.currentEditor() else { return }
+                self.finish(with: nil)
+            }
+        }
     }
 }

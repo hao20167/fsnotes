@@ -623,10 +623,26 @@ public class NotesTextProcessor {
         }
 
         #if IOS_APP || os(OSX)
+        // Hidden syntax: conceal `[` and `](url)` like other Markdown markers (revealed on the
+        // line being edited) so only the link text shows. $2 of both anchor patterns is the text.
+        func concealLinkSyntax(_ result: NSTextCheckingResult?) {
+            guard let match = result?.range, let text = result?.range(at: 2),
+                  text.location != NSNotFound, text.location > match.location,
+                  NSMaxRange(text) < NSMaxRange(match) else { return }
+            concealSyntax(in: attributedString, range: NSRange(location: match.location, length: text.location - match.location))
+            concealSyntax(in: attributedString, range: NSRange(location: NSMaxRange(text), length: NSMaxRange(match) - NSMaxRange(text)))
+        }
+
         // We detect and process inline anchors (links)
         NotesTextProcessor.anchorInlineRegex.matches(string, range: paragraphRange) { (result) -> Void in
             guard let range = result?.range else { return }
-            attributedString.addAttribute(.font, value: codeFont, range: range)
+            // Hidden syntax: show the link text in the note font, like rendered Markdown
+            let concealLink = UserDefaultsManagement.hideMarkdownSyntax
+            if concealLink {
+                concealLinkSyntax(result)
+            } else {
+                attributedString.addAttribute(.font, value: codeFont, range: range)
+            }
             //attributedString.fixAttributes(in: range)
             
             var destinationLink : String?
@@ -659,23 +675,22 @@ public class NotesTextProcessor {
             
             guard let destinationLinkString = destinationLink else { return }
             
-            NotesTextProcessor.coupleSquareRegex.matches(string, range: range) { (innerResult) -> Void in
-                guard let innerRange = innerResult?.range else { return }
-                var _range = innerRange
-                _range.location = _range.location + 1
-                _range.length = _range.length - 2
-                
-                let substring = attributedString.mutableString.substring(with: _range)
-                guard substring.lengthOfBytes(using: .utf8) > 0 else { return }
-                
-                attributedString.addAttribute(.link, value: destinationLinkString, range: _range)
+            // The whole link text ($2), also when it holds brackets: `[a [b] c](url)`
+            if let textRange = result?.range(at: 2), textRange.location != NSNotFound, textRange.length > 0 {
+                attributedString.addAttribute(.link, value: destinationLinkString, range: textRange)
             }
         }
         #endif
         
         NotesTextProcessor.anchorInlineGFMRegex.matches(string, range: paragraphRange) { (result) -> Void in
             guard let range = result?.range else { return }
-            attributedString.addAttribute(.font, value: codeFont, range: range)
+            // Hidden syntax: show the link text in the note font, like rendered Markdown
+            let concealLink = UserDefaultsManagement.hideMarkdownSyntax
+            if concealLink {
+                concealLinkSyntax(result)
+            } else {
+                attributedString.addAttribute(.font, value: codeFont, range: range)
+            }
             //attributedString.fixAttributes(in: range)
             
             var destinationLink : String?
@@ -731,16 +746,9 @@ public class NotesTextProcessor {
             guard let destinationLinkString = destinationLink else { return }
             
             // Title [text]
-            NotesTextProcessor.coupleSquareRegex.matches(string, range: range) { (innerResult) -> Void in
-                guard let innerRange = innerResult?.range else { return }
-                var _range = innerRange
-                _range.location = _range.location + 1
-                _range.length = _range.length - 2
-                
-                let substring = attributedString.mutableString.substring(with: _range)
-                guard substring.lengthOfBytes(using: .utf8) > 0 else { return }
-                
-                attributedString.addAttribute(.link, value: destinationLinkString, range: _range)
+            // The whole link text ($2), also when it holds brackets: `[a [b] c](url)`
+            if let textRange = result?.range(at: 2), textRange.location != NSNotFound, textRange.length > 0 {
+                attributedString.addAttribute(.link, value: destinationLinkString, range: textRange)
             }
         }
 

@@ -16,11 +16,19 @@ This fork is based on FSNotes 7.6.0. Notes stay plain files on disk: only the in
 - **Basic Vim mode** (View → Vim Mode).
   - Normal, Insert, Visual and Visual Line modes with a block caret and a mode indicator.
   - Motions (`h j k l w b e 0 ^ $ gg G { } f t ; ,`), operators (`d c y > <` with counts and text objects such as `iw`, `i"`, `i(`), `x s r ~ J p P o O`, `.` repeat.
-  - `u` / `Ctrl-R` undo and redo one whole command (an insert session counts as one step).
+  - Search with `/` and `?` (regex, case-insensitive unless the pattern has capitals), then `n` / `N`; `*` / `#` search the word under the caret.
+  - `y` briefly highlights what was copied and also copies it to the system clipboard; `p` / `P` paste text copied in other apps.
+  - `u` / `Ctrl-R` undo and redo one whole command (an insert session counts as one step); `Cmd+Z` works in every mode.
   - With Vim mode on, `Esc` belongs to Vim; use `Cmd+Shift+B` to hide the explorer.
 - **Inline preview of LaTeX math and Markdown tables** (when "Hide Markdown syntax" is on).
   - `$…$`, `\(…\)` and `$$…$$` render with [SwiftMath](https://github.com/mgriebling/SwiftMath); tables render as a grid.
   - The line under the caret switches back to the raw Markdown for editing. Math inside code is left alone.
+  - Markdown links `[text](url)` show only their text, as a clickable link.
+- **Preview (`Cmd+/`) renders LaTeX reliably** (with Preview MathJax on).
+  - Works in every note, not only notes with images; `$…$`, `$$…$$`, `\(…\)` and `\[…\]` reach MathJax untouched (matrices with `\\`, subscripts with `_`).
+  - `$$…$$` inside a sentence stays in the sentence like in the editor; alone on its line it is centered.
+  - Extensions such as `\color`, `\cancel`, `\boldsymbol` and `\ce` are bundled; a formula that still fails is shown in red while all others render.
+  - Focus stays in the preview (typing no longer jumps to the hidden search field); list numbers and wide formulas no longer get cut off.
 - Builds with Xcode 16.2 (newer macOS 26 APIs are compiled only with Xcode 26).
 
 ### Install (replaces FSNotes)
@@ -44,7 +52,7 @@ This fork is based on FSNotes 7.6.0. Notes stay plain files on disk: only the in
 
 FSNotes is a fast, native notes app for macOS and iOS. It gives you a focused writing experience while keeping every note in portable Markdown or plain-text files—not a proprietary database.
 
-<img src="https://fsnot.es/img/fsnotes7/FSNotes7_macOS_Dark.webp?v=2" alt="FSNotes for macOS in Dark Mode" style="max-width:100%;">
+<img src="docs/screenshot-macos.png" alt="FSNotes (this fork) on macOS: tree explorer, inline math and table preview" style="max-width:100%;">
 
 ## Why choose FSNotes
 

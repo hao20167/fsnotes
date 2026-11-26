@@ -475,7 +475,10 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
     
     @IBAction func togglePreview(_ sender: Any) {
         guard let editor = vcEditor else { return }
-        
+
+        // A pending vim `/` search belongs to the editor view that is going away
+        VimSearchBar.shared.dismiss()
+
         let firstResp = view.window?.firstResponder
 
         if !editor.isPreviewEnabled() {
@@ -492,8 +495,10 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
             cancelTextSearch()
             refillEditArea(force: true)
 
-            if let mdView = vcEditor?.editorViewController?.vcEditor?.markdownView {
-                view.window?.makeFirstResponder(mdView)
+            // The web view itself: the container view cannot take focus, and the window would
+            // fall back to the (possibly hidden) search field
+            if let webView = vcEditor?.editorViewController?.vcEditor?.markdownView?.webView {
+                view.window?.makeFirstResponder(webView)
             }
         } else {
             disablePreview()
@@ -508,8 +513,8 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
         } else {
             var responder: NSResponder? = vcEditor
             
-            if vcEditor?.isPreviewEnabled() == true, let mView = vcEditor?.markdownView {
-                responder = mView
+            if vcEditor?.isPreviewEnabled() == true, let webView = vcEditor?.markdownView?.webView {
+                responder = webView
             }
             
             if let responder = responder {
@@ -1421,8 +1426,14 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
     func focusEditArea() {
         guard let editor = vcEditor,
               let note = editor.note,
-              !editor.isPreviewEnabled(),
               note.container != .encryptedTextPack else { return }
+
+        if editor.isPreviewEnabled() {
+            if let webView = editor.markdownView?.webView {
+                editor.window?.makeFirstResponder(webView)
+            }
+            return
+        }
 
         editor.window?.makeFirstResponder(editor)
 
@@ -1445,6 +1456,11 @@ class EditorViewController: NSViewController, NSTextViewDelegate, NSMenuItemVali
 
             editor.textStorage?.removeHighlight()
             note.save(attributed: editor.attributedString())
+
+            // An edit that leaves the caret in place posts no selection change: count here too
+            if editor.viewDelegate != nil {
+                vc.updateCounters(note: note, charRange: editor.selectedRange())
+            }
 
             updateLastEditedStatus()
             vc.reSort(note: note)

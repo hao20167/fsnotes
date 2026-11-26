@@ -224,7 +224,10 @@ class MPreviewView: WKWebView, WKUIDelegate, WKNavigationDelegate {
         
         let markdownString = note.getPrettifiedContent()
 
-        if let urls = note.imageUrl, urls.count > 0 {
+        // MathJax is a file inside MPreview.bundle and a page loaded with loadHTMLString
+        // cannot read it: render through the temporary bundle like notes with images.
+        let hasImages = (note.imageUrl?.count ?? 0) > 0
+        if hasImages || UserDefaultsManagement.mathJaxPreview {
             cleanCache()
             
             let dst = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("wkPreview")
@@ -268,6 +271,11 @@ class MPreviewView: WKWebView, WKUIDelegate, WKNavigationDelegate {
         }
 
         return """
+            <style>
+              .fsn-math-error { color: #d33; }
+              /* A display formula wider than the page scrolls by itself instead of the whole page */
+              mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; max-width: 100%; padding: 0.2em 0; }
+            </style>
             <script>
             MathJax = {
               tex: {
@@ -277,6 +285,60 @@ class MPreviewView: WKWebView, WKUIDelegate, WKNavigationDelegate {
                     ['$$', '$$'],
                     ['\\\\((', '\\\\))']
                 ]
+              },
+              startup: {
+                // MathJax gives up on the rest of the page when one formula fails in a way it
+                // cannot show inline (an extension that does not load). Then convert the
+                // formulas one by one: the failing ones stay as red source text, all others render.
+                pageReady: function () {
+                  // The page's onload rebuilds the body HTML (table of contents): typesetting
+                  // before it ends would write into nodes that are about to be replaced.
+                  var loaded = new Promise(function (resolve) {
+                    if (document.readyState === 'complete') { resolve(); }
+                    else { window.addEventListener('load', function () { setTimeout(resolve, 0); }); }
+                  });
+                  return loaded.then(function () {
+                    return MathJax.startup.defaultPageReady();
+                  }).catch(function () {
+                    var delimiters = [['$$', '$$', true], ['\\\\[', '\\\\]', true], ['\\\\(', '\\\\)', false], ['$', '$', false]];
+                    function parse(text) {
+                      var t = text.trim();
+                      for (var i = 0; i < delimiters.length; i++) {
+                        var d = delimiters[i];
+                        if (t.length > d[0].length + d[1].length && t.indexOf(d[0]) === 0 && t.slice(-d[1].length) === d[1]) {
+                          return { tex: t.slice(d[0].length, t.length - d[1].length), display: d[2] };
+                        }
+                      }
+                      return null;
+                    }
+                    function withTimeout(promise) {
+                      return Promise.race([promise, new Promise(function (resolve, reject) {
+                        setTimeout(function () { reject(new Error('timed out')); }, 5000);
+                      })]);
+                    }
+                    var items = Array.prototype.slice.call(document.querySelectorAll('span.fsn-math')).filter(function (el) {
+                      return !el.closest('code, pre') && !el.querySelector('mjx-container');
+                    });
+                    return items.reduce(function (chain, el) {
+                      return chain.then(function () {
+                        var formula = parse(el.textContent);
+                        if (!formula) { return; }
+                        return withTimeout(MathJax.tex2chtmlPromise(formula.tex, { display: formula.display })).then(function (node) {
+                          el.textContent = '';
+                          el.appendChild(node);
+                        }).catch(function (e) {
+                          el.classList.add('fsn-math-error');
+                          el.title = String((e && e.message) || e);
+                        });
+                      });
+                    }, Promise.resolve()).then(function () {
+                      // Styles of the newly converted formulas (updateDocument would undo them)
+                      var sheet = MathJax.chtmlStylesheet();
+                      var old = sheet.id && document.getElementById(sheet.id);
+                      if (old) { old.parentNode.replaceChild(sheet, old); } else { document.head.appendChild(sheet); }
+                    });
+                  });
+                }
               }
             };
             </script>
@@ -385,20 +447,28 @@ class MPreviewView: WKWebView, WKUIDelegate, WKNavigationDelegate {
         let indexURL = webkitPreview.appendingPathComponent("index.html")
         let mainCssUrl = webkitPreview.appendingPathComponent("main.css")
 
+        // Which app build copied the resources: another build (an update, or a different
+        // FSNotes sharing this temporary folder) copies them again, so new files reach it.
+        let stampURL = webkitPreview.appendingPathComponent(".fsnotes-build")
+        let executableDate = Bundle.main.executableURL
+            .flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date }?
+            .timeIntervalSince1970 ?? 0
+        let build = "\(Bundle.main.bundlePath)|\(executableDate)"
+        let copiedBuild = try? String(contentsOf: stampURL, encoding: .utf8)
+
         // If updating markdown contents, no need to re-copy bundle.
-        if !FileManager.default.fileExists(atPath: indexURL.path) || !FileManager.default.fileExists(atPath: mainCssUrl.path) {
+        if !FileManager.default.fileExists(atPath: indexURL.path) || !FileManager.default.fileExists(atPath: mainCssUrl.path) || copiedBuild != build {
             // Copy bundle resources to temporary location.
             do {
                 let fileList = try FileManager.default.contentsOfDirectory(atPath: bundleResourceURL.path)
                 for file in fileList {
                     let tmpURL = webkitPreview.appendingPathComponent(file)
 
-                    if ["css", "js"].contains(file) {
-                        try? FileManager.default.removeItem(at: tmpURL)
-                    }
-
+                    // Replace what an older copy left (only the bundle's own items)
+                    try? FileManager.default.removeItem(at: tmpURL)
                     try? FileManager.default.copyItem(atPath: bundleResourceURL.appendingPathComponent(file).path, toPath: tmpURL.path)
                 }
+                try? build.write(to: stampURL, atomically: true, encoding: .utf8)
             } catch {
                 print(error)
             }

@@ -925,6 +925,7 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
 
             // Close the vim command/undo group on the old note's undo manager first
             vim.noteDidChange()
+            VimSearchBar.shared.dismiss()
         }
 
         if !note.isLoaded {
@@ -1197,7 +1198,18 @@ class EditTextView: NSTextView, NSTextFinderClient, NSSharingServicePickerDelega
             NSCursor.iBeam.set()
         }
     }
-    
+
+    // Cmd+Z / Cmd+Shift+Z go to the Edit menu without reaching keyDown: let vim close its
+    // insert undo group first, then the menu performs the undo as usual.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if UserDefaultsManagement.vimMode, window?.firstResponder === self,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            vim.prepareForMenuUndo()
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
         defer {
             saveSelectedRange()

@@ -1182,7 +1182,15 @@ class ViewController: EditorViewController,
             }
         }
 
-        if let fr = mw.firstResponder, !fr.isKind(of: EditTextView.self), !fr.isKind(of: NSTextView.self), !event.modifierFlags.contains(.command),
+        // Type-to-search, but not from the preview (keys belong to the page) and not while the
+        // explorer, which holds the search field, is hidden
+        let inPreview: Bool = {
+            guard let view = mw.firstResponder as? NSView, let preview = editor?.markdownView else { return false }
+            return view.isDescendant(of: preview)
+        }()
+
+        if !inPreview, isVisibleSidebar(),
+            let fr = mw.firstResponder, !fr.isKind(of: EditTextView.self), !fr.isKind(of: NSTextView.self), !event.modifierFlags.contains(.command),
             !event.modifierFlags.contains(.control) {
 
             if let char = event.characters {
@@ -1223,7 +1231,7 @@ class ViewController: EditorViewController,
                 }
                 
                 if vcEditor?.isPreviewEnabled() == true {
-                    NSApp.mainWindow?.makeFirstResponder(editor.markdownView)
+                    NSApp.mainWindow?.makeFirstResponder(editor.markdownView?.webView)
                 } else {
                     focusEditArea()
                 }
@@ -1787,8 +1795,10 @@ class ViewController: EditorViewController,
         // NSMutableAttributedString is not safe to read while the editor mutates it.
         // Take an immutable snapshot on the main thread and only count that snapshot
         // in the background operation.
-        let content = note.content.string
-        
+        // The editor's text is current; note.content is refreshed by an asynchronous save
+        let editorShowsNote = editor?.note === note && editor?.isPreviewEnabled() == false
+        let content = (editorShowsNote ? editor?.string : nil) ?? note.content.string
+
         counterQueue.cancelAllOperations()
         
         let operation = BlockOperation()

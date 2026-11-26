@@ -511,7 +511,8 @@ pre > .copyCode {
 }
 
 body > ul, body > ol {
-    margin-left: 20px;
+    /* Room for the markers ("10.") also with large fonts */
+    margin-left: max(20px, 1.6em);
     padding: 0;
 
 }
